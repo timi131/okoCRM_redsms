@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import List
+
+# Адреса, с которых REDSMS шлёт вебхуки (docs.redsms.ru/http/webhook/)
+REDSMS_CALLBACK_IPS = ["37.9.15.244", "5.188.131.157", "5.188.131.158", "82.202.237.68"]
+
+
+def _bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _list(name: str, default: List[str]) -> List[str]:
+    v = os.environ.get(name)
+    if v is None:
+        return list(default)
+    return [x.strip() for x in v.split(",") if x.strip()]
+
+
+@dataclass
+class Config:
+    # Секретный ключ виджета: OkoStore → «Мои виджеты» → виджет → «Секретный ключ»
+    widget_private_key: str
+    # Секрет сервиса для подписи dlrUrl, которые мы отдаём REDSMS
+    app_secret: str
+    # Внешний https-адрес этого сервиса, например https://sms.example.com
+    public_base_url: str
+    db_path: str = "data/okocrm_redsms.sqlite3"
+    listen_host: str = "0.0.0.0"
+    listen_port: int = 8080
+    okocrm_api_base: str = "https://webhook.okocrm.com/v4/sms"
+    redsms_api_base: str = "https://cp.redsms.ru/api"
+    # Пустой список отключает проверку IP для колбэков REDSMS
+    redsms_allowed_ips: List[str] = field(default_factory=lambda: list(REDSMS_CALLBACK_IPS))
+    # Брать IP клиента из X-Forwarded-For (только если сервис стоит за своим reverse proxy)
+    trust_x_forwarded_for: bool = False
+    # Как часто перепроверять ключ и баланс REDSMS у всех подключений, сек
+    healthcheck_interval: int = 600
+    # Через сколько минут без колбэка опрашивать статус сообщения в REDSMS
+    poll_after_minutes: int = 10
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        missing = [n for n in ("OKOCRM_WIDGET_PRIVATE_KEY", "APP_SECRET", "PUBLIC_BASE_URL") if not os.environ.get(n)]
+        if missing:
+            raise SystemExit("Не заданы переменные окружения: " + ", ".join(missing))
+        return cls(
+            widget_private_key=os.environ["OKOCRM_WIDGET_PRIVATE_KEY"],
+            app_secret=os.environ["APP_SECRET"],
+            public_base_url=os.environ["PUBLIC_BASE_URL"].rstrip("/"),
+            db_path=os.environ.get("DB_PATH", cls.db_path),
+            listen_host=os.environ.get("LISTEN_HOST", cls.listen_host),
+            listen_port=int(os.environ.get("LISTEN_PORT", cls.listen_port)),
+            okocrm_api_base=os.environ.get("OKOCRM_API_BASE", cls.okocrm_api_base).rstrip("/"),
+            redsms_api_base=os.environ.get("REDSMS_API_BASE", cls.redsms_api_base).rstrip("/"),
+            redsms_allowed_ips=_list("REDSMS_ALLOWED_IPS", REDSMS_CALLBACK_IPS),
+            trust_x_forwarded_for=_bool("TRUST_X_FORWARDED_FOR", False),
+            healthcheck_interval=int(os.environ.get("HEALTHCHECK_INTERVAL", cls.healthcheck_interval)),
+            poll_after_minutes=int(os.environ.get("POLL_AFTER_MINUTES", cls.poll_after_minutes)),
+        )

@@ -1,0 +1,21 @@
+{
+  "id": "redsms-gateway",
+  "author": "CHANGE_ME",
+  "version": "1.0.0",
+  "settings": {
+    "text": "Отправка SMS через REDSMS: из карточки клиента, шаблонов, автодействия «Отправить SMS» и ИИ-ассистента. Статусы доставки приходят в ленту. Ключ API создаётся в кабинете REDSMS: «Настройки → HTTP API». Если там включён белый список IP, добавьте IP сервера интеграции.",
+    "links": [
+      { "title": "Кабинет REDSMS: ключ API", "url": "https://cp.redsms.ru/settings/api" },
+      { "title": "Документация REDSMS", "url": "https://docs.redsms.ru/http/" }
+    ],
+    "fields": [
+      { "name": "login", "type": "text", "label": "Логин REDSMS", "required": true },
+      { "name": "api_key", "type": "text", "label": "Ключ API REDSMS", "required": true },
+      { "name": "senders", "type": "text", "label": "Имена отправителей через запятую (как зарегистрированы в REDSMS)", "required": true }
+    ]
+  },
+  "sms": {
+    "webhook_url": "https://sms.example.com/okocrm/events",
+    "send_url": "https://sms.example.com/okocrm/send"
+  }
+}
