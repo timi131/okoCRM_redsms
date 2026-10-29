@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
@@ -18,7 +20,9 @@ def make_server(bridge: Bridge, host: str, port: int) -> ThreadingHTTPServer:
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "okocrm-redsms"
+        sys_version = ""         # не раскрываем версию Python в заголовке Server
         protocol_version = "HTTP/1.1"
+        timeout = 20             # сокет без данных дольше — закрываем (защита от медленных клиентов)
 
         def log_message(self, fmt: str, *args: Any) -> None:
             log.debug("%s " + fmt, self.client_ip(), *args)
@@ -31,7 +35,13 @@ def make_server(bridge: Bridge, host: str, port: int) -> ThreadingHTTPServer:
             return self.client_address[0]
 
         def read_body(self) -> Optional[bytes]:
-            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0:
+                self.reply(400, {"message": "Invalid Content-Length"})
+                return None
             if length > MAX_BODY:
                 self.reply(413, {"message": "Слишком большое тело"})
                 return None
@@ -92,6 +102,16 @@ def make_server(bridge: Bridge, host: str, port: int) -> ThreadingHTTPServer:
             if not isinstance(data, dict):
                 self.reply(400, {"message": "Invalid JSON"})
                 return None
+            if cfg.signature_max_age:
+                # Подпись не содержит времени, но time входит в подписанное тело: старый запрос не переиграть
+                try:
+                    age = abs(time.time() - int(data.get("time")))
+                except (TypeError, ValueError):
+                    age = None
+                if age is None or age > cfg.signature_max_age:
+                    log.warning("устаревший запрос %s (time=%r) от %s", self.path, data.get("time"), self.client_ip())
+                    self.reply(403, {"message": "Request expired"})
+                    return None
             return data
 
         def okocrm_events(self, body: bytes) -> None:
@@ -138,4 +158,30 @@ def make_server(bridge: Bridge, host: str, port: int) -> ThreadingHTTPServer:
             bridge.handle_dlr(parts[3], data if isinstance(data, dict) else {})
             self.reply(200, {"ok": True})
 
-    return ThreadingHTTPServer((host, port), Handler)
+    return _BoundedServer((host, port), Handler, cfg.max_concurrent_requests)
+
+
+class _BoundedServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer с потолком одновременных запросов: сверх лимита — сразу 503, без нового потока."""
+
+    daemon_threads = True
+
+    def __init__(self, addr, handler, max_concurrent: int):
+        super().__init__(addr, handler)
+        self._slots = threading.BoundedSemaphore(max(1, max_concurrent))
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()

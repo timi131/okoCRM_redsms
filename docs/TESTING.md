@@ -45,7 +45,8 @@ python3 -W ignore -m unittest discover -s tests -v
 Терминал 1, мост:
 
 ```bash
-OKOCRM_API_BASE=http://127.0.0.1:9900/v4/sms OKOCRM_WIDGET_PRIVATE_KEY=test APP_SECRET=test \
+ALLOW_INSECURE_URLS=true OKOCRM_API_BASE=http://127.0.0.1:9900/v4/sms OKOCRM_WIDGET_PRIVATE_KEY=test \
+APP_SECRET=$(openssl rand -hex 32) \
 ENCRYPTION_KEY=$(python3 -m okocrm_redsms genkey) \
 PUBLIC_BASE_URL=https://example.com POLL_AFTER_MINUTES=1 DB_PATH=/tmp/okocrm-redsms-test.sqlite3 \
 python3 -m okocrm_redsms

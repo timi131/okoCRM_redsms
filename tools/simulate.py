@@ -4,7 +4,8 @@
 (PUT senders, POST status, POST events), а в мост отправляет подписанные installed и sms.send.
 
 Мост запускать так (в другом терминале):
-    OKOCRM_API_BASE=http://127.0.0.1:9900/v4/sms OKOCRM_WIDGET_PRIVATE_KEY=test APP_SECRET=test \
+    ALLOW_INSECURE_URLS=true OKOCRM_API_BASE=http://127.0.0.1:9900/v4/sms OKOCRM_WIDGET_PRIVATE_KEY=test \
+    APP_SECRET=$(openssl rand -hex 32) \
     ENCRYPTION_KEY=$(python3 -m okocrm_redsms genkey) \
     PUBLIC_BASE_URL=https://<туннель или любой> POLL_AFTER_MINUTES=1 python3 -m okocrm_redsms
 

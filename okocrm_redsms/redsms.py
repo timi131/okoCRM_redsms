@@ -70,7 +70,8 @@ class RedsmsClient:
     def _headers(self) -> Dict[str, str]:
         # secret = md5(ts + API_KEY); ts — произвольная строка, делаем её уникальной на каждый запрос
         ts = f"{time.time():.6f}-{uuid.uuid4().hex[:8]}"
-        secret = hashlib.md5((ts + self.api_key).encode("utf-8")).hexdigest()
+        # MD5 задан протоколом REDSMS, выбора нет; ключ при этом не передаётся, а ts уникален на каждый запрос
+        secret = hashlib.md5((ts + self.api_key).encode("utf-8"), usedforsecurity=False).hexdigest()
         return {"login": self.login, "ts": ts, "secret": secret, "Accept": "application/json"}
 
     def client_info(self) -> Response:

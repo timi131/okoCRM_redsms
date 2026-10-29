@@ -6,7 +6,10 @@ import sys
 import tempfile
 import threading
 import time
+import socket
+import sqlite3
 import unittest
+from unittest import mock
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from okocrm_redsms import service  # noqa: E402
 from okocrm_redsms.config import Config  # noqa: E402
+from okocrm_redsms.service import mask_phone, redact  # noqa: E402
 from okocrm_redsms.http_server import make_server  # noqa: E402
 from okocrm_redsms.service import Bridge  # noqa: E402
 from okocrm_redsms.crypto import Cipher, generate_key  # noqa: E402
@@ -130,13 +134,13 @@ class BridgeTest(unittest.TestCase):
         settings = settings or {"login": "user", "api_key": "KEY", "senders": "Shop, Shop-24"}
         status, _ = self.post("/okocrm/events", {
             "event": "installed", "site_id": 1, "subdomain": "demo", "setting_ulid": ULID,
-            "time": 1, "token": TOKEN, "settings": settings, "user": None})
+            "time": int(time.time()), "token": TOKEN, "settings": settings, "user": None})
         self.assertEqual(status, 200)
 
     def send(self, key="a" * 32, **extra):
         body = {"event": "sms.send", "site_id": 1, "subdomain": "demo", "setting_ulid": ULID,
                 "message_key": key, "phone": "+79991234567", "text": "Ваш заказ готов",
-                "sender": "Shop", "send_at": None, "time": 1, **extra}
+                "sender": "Shop", "send_at": None, "time": int(time.time()), **extra}
         return self.post("/okocrm/send", body, headers={"Idempotency-Key": key})
 
     def oko_events(self):
@@ -248,7 +252,7 @@ class BridgeTest(unittest.TestCase):
     def test_uninstalled_drops_token(self):
         self.install()
         self.post("/okocrm/events", {"event": "uninstalled", "site_id": 1, "subdomain": "demo",
-                                     "setting_ulid": ULID, "time": 2})
+                                     "setting_ulid": ULID, "time": int(time.time())})
         status, _ = self.send()
         self.assertEqual(status, 409)
 
@@ -413,6 +417,98 @@ class BridgeTest(unittest.TestCase):
         self.assertNotIn("secret", raw[0])
         conn = self.bridge.store.get_connection(ULID)
         self.assertEqual((conn["token"], conn["api_key"]), (TOKEN, "KEY"))
+
+    # --- безопасность ------------------------------------------------------
+
+    def test_replayed_old_request_is_rejected(self):
+        status, body = self.post("/okocrm/events", {
+            "event": "uninstalled", "site_id": 1, "subdomain": "demo", "setting_ulid": ULID,
+            "time": int(time.time()) - 3600})
+        self.assertEqual(status, 403)
+        self.assertEqual(body["message"], "Request expired")
+
+    def test_phone_and_text_not_stored_in_plaintext(self):
+        self.install()
+        _, body = self.send(text="Ваш код 4821")
+        self.wait(lambda: self.fake.find("POST", "/api/message"))
+        self.wait(lambda: self.bridge.store.get_message(body["message_id"])["text"] == "")
+        raw = sqlite3.connect(self.cfg.db_path).execute(
+            "SELECT phone, text FROM messages WHERE id = ?", (body["message_id"],)).fetchone()
+        self.assertTrue(raw[0].startswith("enc:"))
+        self.assertEqual(raw[1], "")  # код больше не хранится
+        dump = "\n".join(sqlite3.connect(self.cfg.db_path).iterdump())
+        self.assertNotIn("79991234567", dump)
+        self.assertNotIn("4821", dump)
+
+    def test_invalid_content_length(self):
+        with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=5) as s:
+            s.sendall(b"POST /okocrm/send HTTP/1.1\r\nHost: x\r\nContent-Length: -5\r\n\r\n")
+            self.assertIn(b" 400 ", s.recv(1024).split(b"\r\n")[0] + b" ")
+
+    def test_concurrency_cap_returns_503(self):
+        from okocrm_redsms.http_server import make_server
+        self.cfg.max_concurrent_requests = 1
+        server = make_server(self.bridge, "127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            hog = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)  # держит слот
+            time.sleep(0.2)
+            with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as s:
+                s.sendall(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+                self.assertTrue(s.recv(1024).startswith(b"HTTP/1.1 503"))
+            hog.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class SecurityUnitTest(unittest.TestCase):
+    def test_mask_and_redact(self):
+        self.assertEqual(mask_phone("+7 (999) 123-45-67"), "+7999***4567")
+        self.assertEqual(mask_phone("123"), "***")
+        self.assertNotIn("79991234567", redact(b'{"errors":[{"to":"+79991234567"}]}'))
+
+    def test_old_plaintext_messages_are_encrypted_on_start(self):
+        key = generate_key()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "db.sqlite3")
+            Store(path, Cipher([key]))
+            c = sqlite3.connect(path)
+            c.execute("INSERT INTO messages (id, setting_ulid, message_key, phone, sender, text, state, created_at, "
+                      "updated_at) VALUES ('m1', ?, 'k', '+79991234567', 'Shop', 'Ваш код 4821', 'final', 1, 1)", (ULID,))
+            c.commit()
+            store = Store(path, Cipher([key]))
+            row = c.execute("SELECT phone, text, phone_hash FROM messages").fetchone()
+            self.assertTrue(row[0].startswith("enc:"))
+            self.assertEqual(row[1], "")  # уже отправленное — текст стёрт
+            self.assertEqual(store.get_message("m1")["phone"], "+79991234567")
+            self.assertEqual(store.count_recent(ULID, 0, phone="+79991234567"), 1)
+
+    def env(self, **extra):
+        base = {"OKOCRM_WIDGET_PRIVATE_KEY": "k", "APP_SECRET": "s" * 32, "ENCRYPTION_KEY": generate_key(),
+                "PUBLIC_BASE_URL": "https://bridge.example.com"}
+        base.update(extra)
+        return mock.patch.dict(os.environ, base, clear=True)
+
+    def test_config_requires_https(self):
+        with self.env(REDSMS_API_BASE="http://cp.redsms.ru/api"), self.assertRaises(SystemExit) as e:
+            Config.from_env()
+        self.assertIn("REDSMS_API_BASE", str(e.exception))
+        with self.env(REDSMS_API_BASE="http://127.0.0.1/api", ALLOW_INSECURE_URLS="true"):
+            Config.from_env()
+
+    def test_config_rejects_short_app_secret(self):
+        with self.env(APP_SECRET="short"), self.assertRaises(SystemExit):
+            Config.from_env()
+
+    def test_secrets_from_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "key")
+            with open(path, "w") as f:
+                f.write("from-file\n")
+            with self.env(OKOCRM_WIDGET_PRIVATE_KEY_FILE=path):
+                del os.environ["OKOCRM_WIDGET_PRIVATE_KEY"]
+                self.assertEqual(Config.from_env().widget_private_key, "from-file")
 
 
 class CryptoTest(unittest.TestCase):

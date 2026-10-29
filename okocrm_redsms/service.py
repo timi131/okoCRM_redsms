@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -131,7 +132,7 @@ class Bridge:
             return "error", ("REDSMS отклонил авторизацию: проверьте логин и ключ API, "
                              "а также белый список IP в настройках HTTP API REDSMS")
         if r.status != 200:
-            log.warning("REDSMS client/info %s: HTTP %s %s", conn["setting_ulid"], r.status, r.body[:200])
+            log.warning("REDSMS client/info %s: HTTP %s %s", conn["setting_ulid"], r.status, redact(r.body[:200]))
             return None, None
         info = (r.json() or {}).get("info") or {}
         if info.get("active") is False:
@@ -215,7 +216,7 @@ class Bridge:
         ]
         for limit, window, filters, reason in checks:
             if limit and self.store.count_recent(ulid, now - window, **filters) >= limit:
-                log.warning("лимит %s: %s (%s)", ulid, reason, phone)
+                log.warning("лимит %s: %s (%s)", ulid, reason, mask_phone(phone))
                 raise SendError(429, "rate_limited",
                                 f"Лимит интеграции REDSMS: {reason}. Защита от зацикленных автодействий — "
                                 f"лимиты меняются в настройках виджета")
@@ -229,6 +230,14 @@ class Bridge:
             self._fail(msg, "not_connected", "Подключение REDSMS удалено до отправки сообщения")
             return
 
+        try:
+            self._submit(msg, conn)
+        finally:
+            # Текст (а в нём бывают коды подтверждения) после передачи в REDSMS не храним
+            self.store.wipe_text(message_id)
+
+    def _submit(self, msg, conn) -> None:
+        message_id = msg["id"]
         start_time = msg["send_at"] if msg["send_at"] and msg["send_at"] > time.time() + 60 else None
         dlr_url = self.dlr_url(msg["setting_ulid"])
         client = self._redsms(conn)
@@ -271,7 +280,7 @@ class Bridge:
             return
 
         reason = _redsms_error_text(data)
-        log.warning("REDSMS send %s: HTTP %s %s", message_id, r.status, r.body[:300])
+        log.warning("REDSMS send %s: HTTP %s %s", message_id, r.status, redact(r.body[:300]))
         if r.status == 401:
             self._fail(msg, "unauthorized", "REDSMS отклонил авторизацию: проверьте логин и ключ API")
             self.pool.submit(self._safe, self.check_health, msg["setting_ulid"])
@@ -431,7 +440,7 @@ class Bridge:
                 self._retry(item, delay, f"HTTP {r.status} {r.body[:200]!r}")
             else:
                 # 401/404 — токен отозван, 422 — невалидное тело: повтор не поможет
-                log.error("OkoCRM %s %s → HTTP %s %s", method, path, r.status, r.body[:300])
+                log.error("OkoCRM %s %s → HTTP %s %s", method, path, r.status, redact(r.body[:300]))
                 self.store.outbox_done(item["id"])
 
     def _retry(self, item, delay: float, error: str) -> None:
@@ -505,6 +514,22 @@ class Bridge:
 def _settings(event: Dict[str, Any]) -> Dict[str, Any]:
     s = event.get("settings")
     return s if isinstance(s, dict) else {}  # без полей OkoCRM присылает пустой массив
+
+
+_PHONE_RE = re.compile(r"\+?\d[\d\- ()]{8,}\d")
+
+
+def mask_phone(phone: str) -> str:
+    """+79991234567 → +7999***4567: в логах достаточно, чтобы найти сообщение, и не раскрывает номер."""
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    if len(digits) < 8:
+        return "***"
+    return f"+{digits[:4]}***{digits[-4:]}"
+
+
+def redact(body: bytes) -> str:
+    """Тело ответа для лога без номеров телефонов (REDSMS возвращает их в errors[].to)."""
+    return _PHONE_RE.sub(lambda m: mask_phone(m.group(0)), body.decode("utf-8", "replace"))
 
 
 def _is_cascade_head(msg) -> bool:

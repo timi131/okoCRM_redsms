@@ -15,12 +15,14 @@ curl https://sms.example.com/healthz  # жив ли мост и доступна
 docker exec -it okocrm-redsms python - <<'EOF'
 import sqlite3; c = sqlite3.connect('/data/okocrm_redsms.sqlite3')
 print(c.execute("select setting_ulid, subdomain, status, status_message from connections where deleted_at is null").fetchall())
-print(c.execute("select id, phone, state, redsms_status, oko_status from messages order by created_at desc limit 20").fetchall())
+print(c.execute("select id, redsms_uuid, state, redsms_status, oko_status from messages order by created_at desc limit 20").fetchall())
 print(c.execute("select kind, attempts, last_error from outbox").fetchall())
 EOF
 ```
 
 Как найти клиента: `subdomain` — это поддомен его аккаунта OkoCRM. Сообщение можно найти по `message_id` (`rs-…`), который OkoCRM хранит у себя, или по `redsms_uuid` из кабинета REDSMS.
+
+Номера телефонов в БД зашифрованы, а тексты SMS стираются после отправки. Номер по `redsms_uuid` смотрите в кабинете REDSMS, а не в базе. Расшифровывать персональные данные «для удобства» не нужно.
 
 ## Частые проблемы
 
@@ -69,10 +71,11 @@ docker cp okocrm-redsms:/data/backup.sqlite3 ./backup-$(date +%F).sqlite3
 
 ## Безопасность
 
-- Ключи API REDSMS и токены OkoCRM в БД зашифрованы (Fernet: AES-128 + HMAC). Ключ шифрования храните отдельно от резервных копий БД.
-- Запросы OkoCRM без верной подписи HMAC-SHA256 отклоняются.
-- Колбэки REDSMS принимаются только по подписанному URL и только с IP REDSMS.
-- При удалении виджета токен и ключ API клиента стираются из БД.
+Меры защиты, известные ограничения и чек-лист оператора описаны в [SECURITY.md](../SECURITY.md). Что видно в эксплуатации:
+
+- `403 Request expired` в логах — запрос OkoCRM старше 15 минут. Если таких много, проверьте время на сервере (NTP).
+- `503` от моста — превышен `MAX_CONCURRENT_REQUESTS`. Проверьте нагрузку или не атакуют ли сервер.
+- Сервис не стартует с сообщением про `ENCRYPTION_KEY` — ключ не совпадает с тем, которым шифровали БД.
 
 ## Контакты
 

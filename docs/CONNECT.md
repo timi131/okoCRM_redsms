@@ -22,7 +22,7 @@ cp .env.example .env
 |---|---|
 | `OKOCRM_WIDGET_PRIVATE_KEY` | Секретный ключ виджета. Пока его нет, впишите временное значение и замените на шаге 3 |
 | `ENCRYPTION_KEY` | Ключ шифрования секретов в БД: `python3 -m okocrm_redsms genkey` (или `docker run --rm okocrm-redsms python -m okocrm_redsms genkey` после сборки). **Сохраните его в менеджере паролей**: без него ключи API клиентов не расшифровать |
-| `APP_SECRET` | Длинная случайная строка, например `openssl rand -hex 32`. **Не меняйте после запуска**: на ней подписаны адреса колбэков у отправленных сообщений |
+| `APP_SECRET` | Случайная строка не короче 32 символов: `openssl rand -hex 32`. **Не меняйте после запуска**: на ней подписаны адреса колбэков у отправленных сообщений |
 | `PUBLIC_BASE_URL` | `https://sms.example.com` |
 | `TRUST_X_FORWARDED_FOR` | `true`, если перед мостом стоит Caddy или nginx (обычно да) |
 
@@ -31,8 +31,13 @@ cp .env.example .env
 ```bash
 docker build -t okocrm-redsms .
 docker run -d --name okocrm-redsms --restart unless-stopped --env-file .env \
+  --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
   -p 127.0.0.1:8080:8080 -v okocrm-redsms:/data okocrm-redsms
 ```
+
+Флаги `--read-only`, `--cap-drop ALL` и `no-new-privileges` запрещают контейнеру менять свою файловую систему (кроме тома `/data`) и повышать права. Порт открыт только на `127.0.0.1`: наружу сервис смотрит только через TLS-прокси.
+
+Секреты можно не держать в `.env`, а передать файлами (Docker secrets): `OKOCRM_WIDGET_PRIVATE_KEY_FILE`, `APP_SECRET_FILE`, `ENCRYPTION_KEY_FILE`. Тогда их не видно в `docker inspect`.
 
 Настроить TLS. Пример `Caddyfile`:
 
@@ -70,7 +75,8 @@ curl https://sms.example.com/healthz
 
    ```bash
    docker rm -f okocrm-redsms && docker run -d --name okocrm-redsms --restart unless-stopped \
-     --env-file .env -p 127.0.0.1:8080:8080 -v okocrm-redsms:/data okocrm-redsms
+     --env-file .env --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
+     -p 127.0.0.1:8080:8080 -v okocrm-redsms:/data okocrm-redsms
    ```
 
 3. Установить виджет в своём аккаунте и заполнить настройки:

@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+# Минимальные права для токена GITHUB_TOKEN
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -12,6 +16,8 @@ jobs:
         python: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -20,3 +26,18 @@ jobs:
       - run: python -m py_compile tools/simulate.py
       - run: docker build -t okocrm-redsms .
         if: matrix.python == '3.12'
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit bandit
+      # Известные уязвимости в зависимостях
+      - run: pip-audit -r requirements.txt
+      # Статический анализ кода на типовые ошибки безопасности (средняя и высокая серьёзность)
+      - run: bandit -r okocrm_redsms -ll

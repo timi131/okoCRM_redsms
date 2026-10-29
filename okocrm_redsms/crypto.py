@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 from typing import List, Optional
 
 try:
@@ -22,8 +25,16 @@ class Cipher:
             raise ValueError("нет ключа шифрования")
         try:
             self._f = MultiFernet([Fernet(k.encode()) for k in keys])
+            primary = base64.urlsafe_b64decode(keys[0].encode())
         except (ValueError, TypeError) as e:
             raise SystemExit("ENCRYPTION_KEY: неверный ключ Fernet. Сгенерируйте: python3 -m okocrm_redsms genkey") from e
+        # Отдельный подключ для слепых индексов: ключ шифрования напрямую для HMAC не используем
+        self._hash_key = hmac.new(primary, b"okocrm-redsms/blind-index/v1", hashlib.sha256).digest()
+
+    def blind_index(self, value: str) -> str:
+        """Детерминированный HMAC для поиска по зашифрованным полям (лимиты по номеру и тексту).
+        После смены ключа индексы меняются — окна лимитов (час) просто начинаются заново."""
+        return hmac.new(self._hash_key, value.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def encrypt(self, value: Optional[str]) -> Optional[str]:
         if value is None or value == "":

@@ -33,9 +33,11 @@ CREATE TABLE IF NOT EXISTS messages (
     id              TEXT PRIMARY KEY, -- message_id, который знает OkoCRM
     setting_ulid    TEXT NOT NULL,
     message_key     TEXT NOT NULL,
-    phone           TEXT NOT NULL,
+    phone           TEXT NOT NULL,    -- зашифрован (enc:…)
+    phone_hash      TEXT,             -- HMAC номера для лимитов
     sender          TEXT NOT NULL,
-    text            TEXT NOT NULL,
+    text            TEXT NOT NULL,    -- зашифрован; стирается после передачи в REDSMS (в нём бывают коды)
+    text_hash       TEXT,             -- HMAC текста для защиты от дублей
     send_at         INTEGER,
     route           TEXT NOT NULL DEFAULT 'sms', -- sms | tgauth,sms
     state           TEXT NOT NULL,    -- queued | sending | submitted | final
@@ -51,7 +53,6 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_uuid ON messages (redsms_uuid);
 CREATE INDEX IF NOT EXISTS messages_state ON messages (state, created_at);
 CREATE INDEX IF NOT EXISTS messages_rate ON messages (setting_ulid, created_at);
-CREATE INDEX IF NOT EXISTS messages_rate_phone ON messages (setting_ulid, phone, created_at);
 
 CREATE TABLE IF NOT EXISTS outbox (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +84,31 @@ class Store:
             if column not in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         c.execute("CREATE INDEX IF NOT EXISTS messages_root ON messages (root_uuid)")
+        c.execute("DROP INDEX IF EXISTS messages_rate_phone")  # был по открытому номеру
+        c.execute("CREATE INDEX IF NOT EXISTS messages_rate_phone_hash ON messages (setting_ulid, phone_hash, created_at)")
         self._encrypt_secrets()
+        self._encrypt_messages()
+
+    def _encrypt_messages(self) -> None:
+        """Шифрует номера и тексты сообщений из старых версий; тексты уже отправленных — стирает."""
+        c = self.conn()
+        rows = c.execute("SELECT id, phone, text, state FROM messages WHERE phone NOT LIKE 'enc:%' "
+                         "OR (text != '' AND text NOT LIKE 'enc:%')").fetchall()
+        for r in rows:
+            phone = self.cipher.decrypt(r["phone"])
+            text = self.cipher.decrypt(r["text"])
+            keep_text = r["state"] in ("queued", "sending")
+            c.execute("UPDATE messages SET phone = ?, phone_hash = ?, text = ?, text_hash = ? WHERE id = ?",
+                      (self.cipher.encrypt(phone), self.cipher.blind_index(phone),
+                       self.cipher.encrypt(text) if keep_text else "", self.cipher.blind_index(text), r["id"]))
+
+    def _msg(self, row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        d = dict(row)
+        d["phone"] = self.cipher.decrypt(d["phone"])
+        d["text"] = self.cipher.decrypt(d["text"])
+        return d
 
     def _encrypt_secrets(self) -> None:
         """Шифрует открытые секреты из старых версий и перешифровывает текущим ключом после его смены."""
@@ -171,10 +196,12 @@ class Store:
         c = self.conn()
         try:
             c.execute(
-                """INSERT INTO messages (id, setting_ulid, message_key, phone, sender, text, send_at, route, state,
-                                         created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
-                (msg["id"], msg["setting_ulid"], msg["message_key"], msg["phone"], msg["sender"], msg["text"],
+                """INSERT INTO messages (id, setting_ulid, message_key, phone, phone_hash, sender, text, text_hash,
+                                         send_at, route, state, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                (msg["id"], msg["setting_ulid"], msg["message_key"],
+                 self.cipher.encrypt(msg["phone"]), self.cipher.blind_index(msg["phone"]), msg["sender"],
+                 self.cipher.encrypt(msg["text"]), self.cipher.blind_index(msg["text"]),
                  msg["send_at"], msg.get("route", "sms"), now, now),
             )
             return msg["id"]
@@ -184,18 +211,22 @@ class Store:
                 raise
             return row["id"]
 
-    def find_by_key(self, ulid: str, message_key: str) -> Optional[sqlite3.Row]:
-        return self.conn().execute("SELECT * FROM messages WHERE setting_ulid = ? AND message_key = ?",
-                                   (ulid, message_key)).fetchone()
+    def find_by_key(self, ulid: str, message_key: str) -> Optional[Dict[str, Any]]:
+        return self._msg(self.conn().execute("SELECT * FROM messages WHERE setting_ulid = ? AND message_key = ?",
+                                             (ulid, message_key)).fetchone())
 
-    def get_message(self, message_id: str) -> Optional[sqlite3.Row]:
-        return self.conn().execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    def get_message(self, message_id: str) -> Optional[Dict[str, Any]]:
+        return self._msg(self.conn().execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone())
 
-    def find_by_uuid(self, ulid: str, uuid: str) -> Optional[sqlite3.Row]:
+    def wipe_text(self, message_id: str) -> None:
+        """Текст передан в REDSMS и больше не нужен — не держим коды подтверждения в БД."""
+        self.conn().execute("UPDATE messages SET text = '' WHERE id = ?", (message_id,))
+
+    def find_by_uuid(self, ulid: str, uuid: str) -> Optional[Dict[str, Any]]:
         """Сообщение по uuid REDSMS: текущему или первому в каскаде."""
-        return self.conn().execute(
+        return self._msg(self.conn().execute(
             "SELECT * FROM messages WHERE setting_ulid = ? AND (redsms_uuid = ? OR root_uuid = ?)",
-            (ulid, uuid, uuid)).fetchone()
+            (ulid, uuid, uuid)).fetchone())
 
     def count_recent(self, ulid: str, since: int, phone: Optional[str] = None, text: Optional[str] = None) -> int:
         """Сколько сообщений подключения принято с момента since; с phone/text — только на этот номер/с этим текстом.
@@ -203,11 +234,11 @@ class Store:
         sql = "SELECT COUNT(*) FROM messages WHERE setting_ulid = ? AND created_at >= ? AND COALESCE(oko_status, '') != 'failed'"
         args: List[Any] = [ulid, since]
         if phone is not None:
-            sql += " AND phone = ?"
-            args.append(phone)
+            sql += " AND phone_hash = ?"
+            args.append(self.cipher.blind_index(phone))
         if text is not None:
-            sql += " AND text = ?"
-            args.append(text)
+            sql += " AND text_hash = ?"
+            args.append(self.cipher.blind_index(text))
         return self.conn().execute(sql, args).fetchone()[0]
 
     def claim_for_sending(self, message_id: str) -> bool:
@@ -217,18 +248,21 @@ class Store:
         return cur.rowcount == 1
 
     def update_message(self, message_id: str, **fields: Any) -> None:
+        unknown = set(fields) - UPDATABLE_MESSAGE_COLUMNS
+        if unknown:
+            raise ValueError(f"нельзя обновлять колонки {sorted(unknown)}")
         fields["updated_at"] = int(time.time())
         cols = ", ".join(f"{k} = ?" for k in fields)
-        self.conn().execute(f"UPDATE messages SET {cols} WHERE id = ?", (*fields.values(), message_id))
+        # Имена колонок — из белого списка выше, значения передаются параметрами
+        self.conn().execute(f"UPDATE messages SET {cols} WHERE id = ?", (*fields.values(), message_id))  # nosec B608
 
     def advance_oko_status(self, message_id: str, new: str, blocked_from: List[str]) -> bool:
         """Атомарно ставит oko_status = new, если текущее значение не new и не входит в blocked_from.
         Защищает от двойной отправки статуса, когда колбэк и опрос приходят одновременно."""
-        marks = ",".join("?" * len(blocked_from)) or "NULL"
-        cur = self.conn().execute(
-            f"""UPDATE messages SET oko_status = ?, updated_at = ?
-                WHERE id = ? AND (oko_status IS NULL OR (oko_status != ? AND oko_status NOT IN ({marks})))""",
-            (new, int(time.time()), message_id, new, *blocked_from))
+        marks = ",".join("?" * len(blocked_from)) or "NULL"  # в запрос подставляются только «?»
+        sql = ("UPDATE messages SET oko_status = ?, updated_at = ? WHERE id = ? "
+               f"AND (oko_status IS NULL OR (oko_status != ? AND oko_status NOT IN ({marks})))")  # nosec B608
+        cur = self.conn().execute(sql, (new, int(time.time()), message_id, new, *blocked_from))
         return cur.rowcount == 1
 
     def purge(self, older_than: int) -> Tuple[int, int]:
@@ -238,18 +272,19 @@ class Store:
         d = c.execute("DELETE FROM connections WHERE deleted_at IS NOT NULL AND deleted_at < ?", (older_than,)).rowcount
         return m, d
 
-    def messages_in_state(self, state: str) -> List[sqlite3.Row]:
-        return self.conn().execute("SELECT * FROM messages WHERE state = ?", (state,)).fetchall()
+    def messages_in_state(self, state: str) -> List[Dict[str, Any]]:
+        return [self._msg(r) for r in self.conn().execute("SELECT * FROM messages WHERE state = ?", (state,))]
 
-    def messages_to_poll(self, older_than: int, newer_than: int, polled_before: int, limit: int = 100) -> List[sqlite3.Row]:
-        return self.conn().execute(
+    def messages_to_poll(self, older_than: int, newer_than: int, polled_before: int,
+                         limit: int = 100) -> List[Dict[str, Any]]:
+        return [self._msg(r) for r in self.conn().execute(
             """SELECT * FROM messages
                WHERE state = 'submitted' AND redsms_uuid IS NOT NULL
                  AND created_at < ? AND created_at > ?
                  AND COALESCE(send_at, 0) < ?
                  AND (polled_at IS NULL OR polled_at < ?)
                ORDER BY created_at LIMIT ?""",
-            (older_than, newer_than, older_than, polled_before, limit)).fetchall()
+            (older_than, newer_than, older_than, polled_before, limit))]
 
     # --- outbox (запросы к OkoCRM с повторами) -----------------------------
 
@@ -274,6 +309,10 @@ class Store:
             (time.time() + delay, error[:500], item_id))
 
 
+# Что сервис меняет в сообщениях через update_message; phone/text — только через insert и wipe_text
+UPDATABLE_MESSAGE_COLUMNS = {"state", "redsms_uuid", "root_uuid", "redsms_status", "oko_status", "polled_at",
+                             "created_at"}
+
 MIGRATIONS = [
     ("connections", "senders_rejected", "TEXT NOT NULL DEFAULT '[]'"),
     ("connections", "tg_cascade", "INTEGER NOT NULL DEFAULT 0"),
@@ -281,6 +320,8 @@ MIGRATIONS = [
     ("connections", "limit_per_phone_hour", "INTEGER"),
     ("messages", "route", "TEXT NOT NULL DEFAULT 'sms'"),
     ("messages", "root_uuid", "TEXT"),
+    ("messages", "phone_hash", "TEXT"),
+    ("messages", "text_hash", "TEXT"),
 ]
 
 
