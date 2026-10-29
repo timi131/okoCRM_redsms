@@ -81,6 +81,9 @@ class Bridge:
         senders = json.loads(conn["senders"])
         if senders:
             self._enqueue(ulid, "senders", [{"name": s} for s in senders])
+        rejected = json.loads(conn["senders_rejected"] or "[]")
+        if rejected:
+            log.warning("%s: имена отправителей отклонены проверкой: %s", ulid, rejected)
         self.check_health(ulid)
 
     def check_health(self, ulid: str) -> None:
@@ -103,8 +106,10 @@ class Bridge:
         if not conn["login"] or not conn["api_key"]:
             return "error", "Укажите логин и ключ API REDSMS в настройках виджета"
         if not json.loads(conn["senders"]):
+            rejected = json.loads(conn["senders_rejected"] or "[]")
+            hint = f" Не подошли: {', '.join(rejected[:5])}." if rejected else ""
             return "error", ("Укажите хотя бы одно имя отправителя, зарегистрированное в REDSMS "
-                             "(латиница, цифры, пробел . _ -, до 15 символов)")
+                             "(латиница, цифры, пробел . _ -, до 15 символов)." + hint)
         try:
             r = self._redsms(conn).client_info()
         except http_client.TransportError as e:
@@ -147,8 +152,9 @@ class Bridge:
         phone = str(req.get("phone") or "").strip()
         text = str(req.get("text") or "")
         sender = str(req.get("sender") or "").strip()
-        if not phone:
-            raise SendError(422, "bad_number", "Не указан номер получателя")
+        digits = sum(ch.isdigit() for ch in phone)
+        if not 10 <= digits <= 15:
+            raise SendError(422, "bad_number", f"Некорректный номер получателя: {phone or 'не указан'}"[:255])
         if not text.strip():
             raise SendError(422, "empty_text", "Пустой текст SMS")
         if not sender:
@@ -272,11 +278,11 @@ class Bridge:
             self.pool.submit(self._safe, self.check_health, msg["setting_ulid"])
 
     def _push_status(self, msg, event: Dict[str, Any]) -> None:
-        new, old = event["status"], msg["oko_status"]
-        # OkoCRM сам игнорирует понижения, но лишние запросы не шлём
-        if old == new or old in ("delivered", "read") and STATUS_RANK[new] <= STATUS_RANK[old]:
+        new = event["status"]
+        # OkoCRM сам игнорирует понижения, но лишние запросы не шлём: после delivered/read — только повышение
+        blocked = [s for s in ("delivered", "read") if STATUS_RANK[new] <= STATUS_RANK[s]]
+        if not self.store.advance_oko_status(msg["id"], new, blocked):
             return
-        self.store.update_message(msg["id"], oko_status=new)
         payload = {"event": "sms.status", "message_id": msg["id"], "time": int(time.time()), **event}
         delay = max(0.0, msg["created_at"] + STATUS_DELAY - time.time())
         self._enqueue(msg["setting_ulid"], "events", payload, delay)
@@ -375,13 +381,24 @@ class Bridge:
             self._outbox_wakeup.clear()
 
     def _maintenance_loop(self) -> None:
-        last_health = 0.0
+        last_health = last_purge = 0.0
         while not self._stop.wait(30):
             self._safe(self.poll_stale_messages)
             if time.time() - last_health >= self.cfg.healthcheck_interval:
                 last_health = time.time()
+                # Параллельно: у каждого подключения запрос в REDSMS до 10 с
                 for conn in self.store.active_connections():
-                    self._safe(self.check_health, conn["setting_ulid"])
+                    self.pool.submit(self._safe, self.check_health, conn["setting_ulid"])
+            if time.time() - last_purge >= 3600:
+                last_purge = time.time()
+                self._safe(self.purge)
+
+    def purge(self) -> None:
+        if self.cfg.retention_days <= 0:
+            return
+        messages, connections = self.store.purge(int(time.time()) - self.cfg.retention_days * 86400)
+        if messages or connections:
+            log.info("очистка: удалено сообщений %s, подключений %s", messages, connections)
 
     def _redsms(self, conn) -> RedsmsClient:
         return RedsmsClient(self.cfg.redsms_api_base, conn["login"], conn["api_key"])

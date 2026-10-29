@@ -48,6 +48,12 @@ def make_server(bridge: Bridge, host: str, port: int) -> ThreadingHTTPServer:
 
         def do_GET(self) -> None:
             if self.path == "/healthz":
+                try:
+                    bridge.store.ping()
+                except Exception:  # noqa: BLE001
+                    log.exception("healthz: база недоступна")
+                    self.reply(503, {"ok": False, "error": "database"})
+                    return
                 self.reply(200, {"ok": True})
             else:
                 self.reply(404, {"message": "Not found"})

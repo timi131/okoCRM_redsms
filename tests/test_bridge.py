@@ -17,7 +17,7 @@ from okocrm_redsms import service  # noqa: E402
 from okocrm_redsms.config import Config  # noqa: E402
 from okocrm_redsms.http_server import make_server  # noqa: E402
 from okocrm_redsms.service import Bridge  # noqa: E402
-from okocrm_redsms.store import Store, parse_senders  # noqa: E402
+from okocrm_redsms.store import Store, parse_senders, split_senders  # noqa: E402
 
 PRIVATE_KEY = "widget-private-key"
 ULID = "01J8Z4N6QYUXH2FA3K5T8DGN2E"
@@ -253,11 +253,75 @@ class BridgeTest(unittest.TestCase):
         self.bridge.poll_stale_messages()
         self.wait(lambda: any(e["status"] == "delivered" for e in self.oko_events()))
 
+    def test_invalid_senders_are_named_in_status(self):
+        self.install({"login": "user", "api_key": "KEY", "senders": "Магазин, ThisNameIsWayTooLong"})
+        self.wait(lambda: self.fake.find("POST", "/v4/sms/status"))
+        body = self.fake.find("POST", "/v4/sms/status")[0][3]
+        self.assertEqual(body["status"], "error")
+        self.assertIn("Магазин", body["message"])
+        self.assertFalse(self.fake.find("PUT", "/v4/sms/senders"))
+
+    def test_garbage_phone_rejected_synchronously(self):
+        self.install()
+        status, body = self.send(phone="123")
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "bad_number")
+        time.sleep(0.3)
+        self.assertFalse(self.fake.find("POST", "/api/message"))
+
+    def test_status_is_pushed_once_under_races(self):
+        self.install()
+        _, body = self.send()
+        self.wait(lambda: self.bridge.store.find_by_uuid(ULID, "uuid-1") is not None)
+        msg = self.bridge.store.find_by_uuid(ULID, "uuid-1")
+        # Колбэк и опрос одновременно сообщают delivered
+        threads = [threading.Thread(target=self.bridge.apply_redsms_status, args=(msg, "delivered")) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.wait(lambda: any(e["status"] == "delivered" for e in self.oko_events()))
+        time.sleep(0.3)
+        self.assertEqual(sum(e["status"] == "delivered" for e in self.oko_events()), 1)
+        # failed после delivered не отправляется
+        self.bridge.apply_redsms_status(msg, "undelivered")
+        time.sleep(0.3)
+        self.assertFalse(any(e["status"] == "failed" for e in self.oko_events()))
+
+    def test_purge_removes_old_messages(self):
+        self.install()
+        _, body = self.send()
+        self.wait(lambda: self.bridge.store.find_by_uuid(ULID, "uuid-1") is not None)
+        self.bridge.store.update_message(body["message_id"], created_at=int(time.time()) - 40 * 86400)
+        self.bridge.purge()
+        self.assertIsNone(self.bridge.store.get_message(body["message_id"]))
+
+    def test_healthz_checks_database(self):
+        with urllib.request.urlopen(self.base + "/healthz", timeout=5) as r:
+            self.assertEqual(json.loads(r.read()), {"ok": True})
+
 
 class SendersTest(unittest.TestCase):
     def test_parse_senders(self):
         self.assertEqual(parse_senders("Shop, Shop-24;Shop\nТест, ThisNameIsWayTooLong, "),
                          ["Shop", "Shop-24"])
+
+    def test_split_senders_reports_rejected(self):
+        self.assertEqual(split_senders("Shop, Тест, ,Shop"), (["Shop"], ["Тест"]))
+
+    def test_migration_adds_column(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "old.sqlite3")
+            c = sqlite3.connect(path)
+            c.execute("CREATE TABLE connections (setting_ulid TEXT PRIMARY KEY, site_id INTEGER, subdomain TEXT, "
+                      "token TEXT, login TEXT, api_key TEXT, senders TEXT NOT NULL DEFAULT '[]', status TEXT, "
+                      "status_message TEXT, installed_at INTEGER, updated_at INTEGER, deleted_at INTEGER)")
+            c.commit()
+            c.close()
+            store = Store(path)
+            store.upsert_connection(ULID, 1, "demo", {"login": "u", "api_key": "k", "senders": "Shop, Тест"})
+            self.assertEqual(json.loads(store.get_connection(ULID)["senders_rejected"]), ["Тест"])
 
 
 if __name__ == "__main__":

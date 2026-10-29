@@ -5,7 +5,7 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS connections (
@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS connections (
     login           TEXT,
     api_key         TEXT,
     senders         TEXT NOT NULL DEFAULT '[]',
+    senders_rejected TEXT NOT NULL DEFAULT '[]', -- имена из настроек, не прошедшие проверку
     status          TEXT,            -- последний отправленный в OkoCRM статус: ok | error
     status_message  TEXT,
     installed_at    INTEGER,
@@ -65,8 +66,15 @@ class Store:
         if path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self._local = threading.local()
-        with self.conn() as c:
-            c.executescript(SCHEMA)
+        c = self.conn()
+        c.executescript(SCHEMA)
+        # Миграции для баз, созданных предыдущими версиями
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(connections)")}
+        if "senders_rejected" not in cols:
+            c.execute("ALTER TABLE connections ADD COLUMN senders_rejected TEXT NOT NULL DEFAULT '[]'")
+
+    def ping(self) -> None:
+        self.conn().execute("SELECT 1").fetchone()
 
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "conn", None)
@@ -85,18 +93,20 @@ class Store:
         now = int(time.time())
         login = str(settings.get("login") or "").strip()
         api_key = str(settings.get("api_key") or "").strip()
-        senders = json.dumps(parse_senders(settings.get("senders")))
+        valid, rejected = split_senders(settings.get("senders"))
+        senders, senders_rejected = json.dumps(valid), json.dumps(rejected, ensure_ascii=False)
         c = self.conn()
         c.execute(
             """INSERT INTO connections (setting_ulid, site_id, subdomain, token, login, api_key, senders,
-                                        installed_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        senders_rejected, installed_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (setting_ulid) DO UPDATE SET
                    site_id = excluded.site_id, subdomain = excluded.subdomain,
                    token = COALESCE(excluded.token, connections.token),
                    login = excluded.login, api_key = excluded.api_key, senders = excluded.senders,
+                   senders_rejected = excluded.senders_rejected,
                    updated_at = excluded.updated_at, deleted_at = NULL""",
-            (ulid, site_id, subdomain, token, login, api_key, senders, now, now),
+            (ulid, site_id, subdomain, token, login, api_key, senders, senders_rejected, now, now),
         )
         if token:
             # Новый токен (установка или перевыпуск) — статус в OkoCRM надо прислать заново
@@ -163,6 +173,23 @@ class Store:
         cols = ", ".join(f"{k} = ?" for k in fields)
         self.conn().execute(f"UPDATE messages SET {cols} WHERE id = ?", (*fields.values(), message_id))
 
+    def advance_oko_status(self, message_id: str, new: str, blocked_from: List[str]) -> bool:
+        """Атомарно ставит oko_status = new, если текущее значение не new и не входит в blocked_from.
+        Защищает от двойной отправки статуса, когда колбэк и опрос приходят одновременно."""
+        marks = ",".join("?" * len(blocked_from)) or "NULL"
+        cur = self.conn().execute(
+            f"""UPDATE messages SET oko_status = ?, updated_at = ?
+                WHERE id = ? AND (oko_status IS NULL OR (oko_status != ? AND oko_status NOT IN ({marks})))""",
+            (new, int(time.time()), message_id, new, *blocked_from))
+        return cur.rowcount == 1
+
+    def purge(self, older_than: int) -> Tuple[int, int]:
+        """Удаляет завершённые сообщения и удалённые подключения старше older_than (unix-время)."""
+        c = self.conn()
+        m = c.execute("DELETE FROM messages WHERE created_at < ? AND state IN ('final', 'submitted')", (older_than,)).rowcount
+        d = c.execute("DELETE FROM connections WHERE deleted_at IS NOT NULL AND deleted_at < ?", (older_than,)).rowcount
+        return m, d
+
     def messages_in_state(self, state: str) -> List[sqlite3.Row]:
         return self.conn().execute("SELECT * FROM messages WHERE state = ?", (state,)).fetchall()
 
@@ -202,18 +229,28 @@ class Store:
 SENDER_ALLOWED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ._-")
 
 
-def parse_senders(raw: Any) -> List[str]:
+def split_senders(raw: Any) -> Tuple[List[str], List[str]]:
     """Имена отправителей из поля настроек: через запятую, точку с запятой или с новой строки.
-    Оставляем только то, что примет PUT senders: 1–15 символов A-Z a-z 0-9 пробел . _ -, без повторов."""
+    Возвращает (подходящие, отклонённые). Подходящие — то, что примет PUT senders:
+    1–15 символов A-Z a-z 0-9 пробел . _ -, без повторов, не больше 100."""
     if raw is None:
-        return []
+        return [], []
     if isinstance(raw, list):
         parts = [str(x) for x in raw]
     else:
         parts = str(raw).replace(";", ",").replace("\n", ",").split(",")
-    result: List[str] = []
+    valid: List[str] = []
+    rejected: List[str] = []
     for p in parts:
         name = p.strip()
-        if 1 <= len(name) <= 15 and set(name) <= SENDER_ALLOWED and name not in result:
-            result.append(name)
-    return result[:100]
+        if not name or name in valid:
+            continue
+        if len(name) <= 15 and set(name) <= SENDER_ALLOWED and len(valid) < 100:
+            valid.append(name)
+        else:
+            rejected.append(name)
+    return valid, rejected
+
+
+def parse_senders(raw: Any) -> List[str]:
+    return split_senders(raw)[0]

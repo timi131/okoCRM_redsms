@@ -43,6 +43,8 @@ class Config:
     healthcheck_interval: int = 600
     # Через сколько минут без колбэка опрашивать статус сообщения в REDSMS
     poll_after_minutes: int = 10
+    # Сколько дней хранить завершённые сообщения и удалённые подключения; 0 — хранить всегда
+    retention_days: int = 30
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -62,4 +64,5 @@ class Config:
             trust_x_forwarded_for=_bool("TRUST_X_FORWARDED_FOR", False),
             healthcheck_interval=int(os.environ.get("HEALTHCHECK_INTERVAL", cls.healthcheck_interval)),
             poll_after_minutes=int(os.environ.get("POLL_AFTER_MINUTES", cls.poll_after_minutes)),
+            retention_days=int(os.environ.get("RETENTION_DAYS", cls.retention_days)),
         )
