@@ -7,16 +7,21 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .crypto import Cipher
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS connections (
     setting_ulid    TEXT PRIMARY KEY,
     site_id         INTEGER,
     subdomain       TEXT,
-    token           TEXT,
+    token           TEXT,             -- зашифрован (enc:…)
     login           TEXT,
-    api_key         TEXT,
+    api_key         TEXT,             -- зашифрован (enc:…)
     senders         TEXT NOT NULL DEFAULT '[]',
     senders_rejected TEXT NOT NULL DEFAULT '[]', -- имена из настроек, не прошедшие проверку
+    tg_cascade      INTEGER NOT NULL DEFAULT 0, -- коды сначала через Telegram, потом SMS
+    limit_per_hour  INTEGER,          -- переопределение лимитов из настроек виджета; NULL — по умолчанию
+    limit_per_phone_hour INTEGER,
     status          TEXT,            -- последний отправленный в OkoCRM статус: ok | error
     status_message  TEXT,
     installed_at    INTEGER,
@@ -32,8 +37,10 @@ CREATE TABLE IF NOT EXISTS messages (
     sender          TEXT NOT NULL,
     text            TEXT NOT NULL,
     send_at         INTEGER,
+    route           TEXT NOT NULL DEFAULT 'sms', -- sms | tgauth,sms
     state           TEXT NOT NULL,    -- queued | sending | submitted | final
-    redsms_uuid     TEXT,
+    redsms_uuid     TEXT,             -- отслеживаемое сообщение REDSMS (в каскаде — текущий канал)
+    root_uuid       TEXT,             -- первое сообщение каскада
     redsms_status   TEXT,
     oko_status      TEXT,             -- последний отправленный в OkoCRM sms.status
     created_at      INTEGER NOT NULL,
@@ -43,6 +50,8 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_uuid ON messages (redsms_uuid);
 CREATE INDEX IF NOT EXISTS messages_state ON messages (state, created_at);
+CREATE INDEX IF NOT EXISTS messages_rate ON messages (setting_ulid, created_at);
+CREATE INDEX IF NOT EXISTS messages_rate_phone ON messages (setting_ulid, phone, created_at);
 
 CREATE TABLE IF NOT EXISTS outbox (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,17 +70,35 @@ CREATE INDEX IF NOT EXISTS outbox_due ON outbox (not_before);
 class Store:
     """SQLite-хранилище. Отдельное соединение на поток, WAL — чтобы HTTP-потоки и воркеры не мешали друг другу."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, cipher: Cipher):
         self.path = path
+        self.cipher = cipher
         if path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self._local = threading.local()
         c = self.conn()
         c.executescript(SCHEMA)
         # Миграции для баз, созданных предыдущими версиями
-        cols = {r["name"] for r in c.execute("PRAGMA table_info(connections)")}
-        if "senders_rejected" not in cols:
-            c.execute("ALTER TABLE connections ADD COLUMN senders_rejected TEXT NOT NULL DEFAULT '[]'")
+        for table, column, ddl in MIGRATIONS:
+            if column not in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        c.execute("CREATE INDEX IF NOT EXISTS messages_root ON messages (root_uuid)")
+        self._encrypt_secrets()
+
+    def _encrypt_secrets(self) -> None:
+        """Шифрует открытые секреты из старых версий и перешифровывает текущим ключом после его смены."""
+        c = self.conn()
+        for row in c.execute("SELECT setting_ulid, token, api_key FROM connections").fetchall():
+            c.execute("UPDATE connections SET token = ?, api_key = ? WHERE setting_ulid = ?",
+                      (self.cipher.reencrypt(row["token"]), self.cipher.reencrypt(row["api_key"]), row["setting_ulid"]))
+
+    def _decrypt(self, row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        d = dict(row)
+        d["token"] = self.cipher.decrypt(d["token"])
+        d["api_key"] = self.cipher.decrypt(d["api_key"])
+        return d
 
     def ping(self) -> None:
         self.conn().execute("SELECT 1").fetchone()
@@ -95,18 +122,24 @@ class Store:
         api_key = str(settings.get("api_key") or "").strip()
         valid, rejected = split_senders(settings.get("senders"))
         senders, senders_rejected = json.dumps(valid), json.dumps(rejected, ensure_ascii=False)
+        tg_cascade = 1 if _truthy(settings.get("telegram_codes")) else 0
+        limit_hour = _optional_int(settings.get("limit_per_hour"))
+        limit_phone = _optional_int(settings.get("limit_per_phone_hour"))
         c = self.conn()
         c.execute(
             """INSERT INTO connections (setting_ulid, site_id, subdomain, token, login, api_key, senders,
-                                        senders_rejected, installed_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        senders_rejected, tg_cascade, limit_per_hour, limit_per_phone_hour,
+                                        installed_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (setting_ulid) DO UPDATE SET
                    site_id = excluded.site_id, subdomain = excluded.subdomain,
                    token = COALESCE(excluded.token, connections.token),
                    login = excluded.login, api_key = excluded.api_key, senders = excluded.senders,
-                   senders_rejected = excluded.senders_rejected,
+                   senders_rejected = excluded.senders_rejected, tg_cascade = excluded.tg_cascade,
+                   limit_per_hour = excluded.limit_per_hour, limit_per_phone_hour = excluded.limit_per_phone_hour,
                    updated_at = excluded.updated_at, deleted_at = NULL""",
-            (ulid, site_id, subdomain, token, login, api_key, senders, senders_rejected, now, now),
+            (ulid, site_id, subdomain, self.cipher.encrypt(token), login, self.cipher.encrypt(api_key), senders,
+             senders_rejected, tg_cascade, limit_hour, limit_phone, now, now),
         )
         if token:
             # Новый токен (установка или перевыпуск) — статус в OkoCRM надо прислать заново
@@ -118,13 +151,13 @@ class Store:
                   (int(time.time()), ulid))
         c.execute("DELETE FROM outbox WHERE setting_ulid = ?", (ulid,))
 
-    def get_connection(self, ulid: str) -> Optional[sqlite3.Row]:
-        return self.conn().execute(
-            "SELECT * FROM connections WHERE setting_ulid = ? AND deleted_at IS NULL", (ulid,)).fetchone()
+    def get_connection(self, ulid: str) -> Optional[Dict[str, Any]]:
+        return self._decrypt(self.conn().execute(
+            "SELECT * FROM connections WHERE setting_ulid = ? AND deleted_at IS NULL", (ulid,)).fetchone())
 
-    def active_connections(self) -> List[sqlite3.Row]:
-        return self.conn().execute(
-            "SELECT * FROM connections WHERE deleted_at IS NULL AND token IS NOT NULL").fetchall()
+    def active_connections(self) -> List[Dict[str, Any]]:
+        return [self._decrypt(r) for r in self.conn().execute(
+            "SELECT * FROM connections WHERE deleted_at IS NULL AND token IS NOT NULL").fetchall()]
 
     def set_connection_status(self, ulid: str, status: str, message: Optional[str]) -> None:
         self.conn().execute("UPDATE connections SET status = ?, status_message = ? WHERE setting_ulid = ?",
@@ -138,11 +171,11 @@ class Store:
         c = self.conn()
         try:
             c.execute(
-                """INSERT INTO messages (id, setting_ulid, message_key, phone, sender, text, send_at, state,
+                """INSERT INTO messages (id, setting_ulid, message_key, phone, sender, text, send_at, route, state,
                                          created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
                 (msg["id"], msg["setting_ulid"], msg["message_key"], msg["phone"], msg["sender"], msg["text"],
-                 msg["send_at"], now, now),
+                 msg["send_at"], msg.get("route", "sms"), now, now),
             )
             return msg["id"]
         except sqlite3.IntegrityError:
@@ -159,8 +192,23 @@ class Store:
         return self.conn().execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
 
     def find_by_uuid(self, ulid: str, uuid: str) -> Optional[sqlite3.Row]:
-        return self.conn().execute("SELECT * FROM messages WHERE setting_ulid = ? AND redsms_uuid = ?",
-                                   (ulid, uuid)).fetchone()
+        """Сообщение по uuid REDSMS: текущему или первому в каскаде."""
+        return self.conn().execute(
+            "SELECT * FROM messages WHERE setting_ulid = ? AND (redsms_uuid = ? OR root_uuid = ?)",
+            (ulid, uuid, uuid)).fetchone()
+
+    def count_recent(self, ulid: str, since: int, phone: Optional[str] = None, text: Optional[str] = None) -> int:
+        """Сколько сообщений подключения принято с момента since; с phone/text — только на этот номер/с этим текстом.
+        Сообщения, о неудаче которых уже сообщили в OkoCRM, не считаются: «Повторить» после ошибки не упирается в лимит."""
+        sql = "SELECT COUNT(*) FROM messages WHERE setting_ulid = ? AND created_at >= ? AND COALESCE(oko_status, '') != 'failed'"
+        args: List[Any] = [ulid, since]
+        if phone is not None:
+            sql += " AND phone = ?"
+            args.append(phone)
+        if text is not None:
+            sql += " AND text = ?"
+            args.append(text)
+        return self.conn().execute(sql, args).fetchone()[0]
 
     def claim_for_sending(self, message_id: str) -> bool:
         cur = self.conn().execute(
@@ -224,6 +272,30 @@ class Store:
         self.conn().execute(
             "UPDATE outbox SET attempts = attempts + 1, not_before = ?, last_error = ? WHERE id = ?",
             (time.time() + delay, error[:500], item_id))
+
+
+MIGRATIONS = [
+    ("connections", "senders_rejected", "TEXT NOT NULL DEFAULT '[]'"),
+    ("connections", "tg_cascade", "INTEGER NOT NULL DEFAULT 0"),
+    ("connections", "limit_per_hour", "INTEGER"),
+    ("connections", "limit_per_phone_hour", "INTEGER"),
+    ("messages", "route", "TEXT NOT NULL DEFAULT 'sms'"),
+    ("messages", "root_uuid", "TEXT"),
+]
+
+
+def _truthy(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on", "да", "y")
+
+
+def _optional_int(v: Any) -> Optional[int]:
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
 
 
 SENDER_ALLOWED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ._-")

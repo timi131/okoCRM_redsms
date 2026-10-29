@@ -21,6 +21,7 @@ cp .env.example .env
 | Переменная | Значение |
 |---|---|
 | `OKOCRM_WIDGET_PRIVATE_KEY` | Секретный ключ виджета. Пока его нет, впишите временное значение и замените на шаге 3 |
+| `ENCRYPTION_KEY` | Ключ шифрования секретов в БД: `python3 -m okocrm_redsms genkey` (или `docker run --rm okocrm-redsms python -m okocrm_redsms genkey` после сборки). **Сохраните его в менеджере паролей**: без него ключи API клиентов не расшифровать |
 | `APP_SECRET` | Длинная случайная строка, например `openssl rand -hex 32`. **Не меняйте после запуска**: на ней подписаны адреса колбэков у отправленных сообщений |
 | `PUBLIC_BASE_URL` | `https://sms.example.com` |
 | `TRUST_X_FORWARDED_FOR` | `true`, если перед мостом стоит Caddy или nginx (обычно да) |
@@ -79,6 +80,10 @@ curl https://sms.example.com/healthz
    | Логин REDSMS | логин кабинета cp.redsms.ru |
    | Ключ API REDSMS | cp.redsms.ru → «Настройки → HTTP API» |
    | Имена отправителей | через запятую, точно как в REDSMS: 1–15 символов, латиница, цифры, пробел, `.`, `_`, `-` |
+   | Коды сначала через Telegram | галочка, если в REDSMS подключён Telegram Gateway (необязательно) |
+   | Лимиты в час | можно оставить пустыми: на аккаунт — 1000, на номер — 10 (необязательно) |
+
+   В документации OkoCRM для полей настроек описан только тип `text`. Если OkoStore не примет `"type": "checkbox"` у поля `telegram_codes`, замените его на `text`: мост понимает значения `1`, `да`, `true`, `on`.
 
 4. Сохранить. В логах моста (`docker logs -f okocrm-redsms`) должны появиться `installed` и `status … → ok`. Во вкладке «Подключение» виджета видны имена отправителей.
 

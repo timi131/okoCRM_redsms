@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -24,6 +25,24 @@ FAILED_STATUSES = {
     "route_closed": "Направление закрыто для отправки в настройках REDSMS",
     "error": "Неизвестная ошибка REDSMS",
 }
+
+
+CASCADE_ROUTE = "tgauth,sms"
+_CODE_WORD = re.compile(r"(код|code|парол|pin)", re.IGNORECASE)
+_CODE = re.compile(r"(?<!\d)\d{4,8}(?!\d)")
+
+
+def extract_code(text: str) -> Optional[str]:
+    """Код подтверждения для Telegram Gateway, если текст похож на сообщение с кодом.
+
+    Telegram Gateway REDSMS принимает только код из 4–8 цифр, поэтому берём текст, где есть слово
+    «код»/«code»/«пароль»/«pin» и ровно одно число из 4–8 цифр. Иначе («Заказ 12345 готов»,
+    «код 1234 действует до 2026 года») — None, и сообщение уходит обычной SMS.
+    """
+    if not _CODE_WORD.search(text):
+        return None
+    codes = set(_CODE.findall(text))
+    return codes.pop() if len(codes) == 1 else None
 
 
 def to_oko_status(redsms_status: str) -> Optional[Dict[str, Any]]:
@@ -59,12 +78,24 @@ class RedsmsClient:
         return http_client.request("GET", f"{self.base_url}/client/info", self._headers(), timeout=self.timeout)
 
     def send_sms(self, to: str, text: str, sender: str, dlr_url: str, start_time: Optional[int] = None) -> Response:
-        body: Dict[str, Any] = {"route": "sms", "from": sender, "to": to, "text": text, "dlrUrl": dlr_url}
+        return self._send({"route": "sms", "from": sender, "to": to, "text": text, "dlrUrl": dlr_url}, start_time)
+
+    def send_tg_then_sms(self, to: str, code: str, text: str, sender: str, dlr_url: str, tg_validity: int,
+                         start_time: Optional[int] = None) -> Response:
+        """Каскад: код через Telegram Gateway; если не доставлен за tg_validity секунд — SMS с полным текстом.
+        В Telegram платят только за delivered/read, недоставка (нет аккаунта) бесплатна."""
+        return self._send({
+            "route": CASCADE_ROUTE, "to": to, "dlrUrl": dlr_url,
+            "tgauth_text": code, "tgauth_validity": max(60, tg_validity),
+            "sms_from": sender, "sms_text": text,
+        }, start_time)
+
+    def _send(self, body: Dict[str, Any], start_time: Optional[int]) -> Response:
         if start_time:
             body["startTime"] = start_time
         return http_client.request("POST", f"{self.base_url}/message", self._headers(), json_body=body,
                                    timeout=self.timeout)
 
-    def get_message(self, message_uuid: str) -> Response:
-        return http_client.request("GET", f"{self.base_url}/message/{message_uuid}?fields=uuid,status,status_time",
+    def get_message(self, message_uuid: str, fields: str = "uuid,status,status_time") -> Response:
+        return http_client.request("GET", f"{self.base_url}/message/{message_uuid}?fields={fields}",
                                    self._headers(), timeout=self.timeout)

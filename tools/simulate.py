@@ -5,6 +5,7 @@
 
 Мост запускать так (в другом терминале):
     OKOCRM_API_BASE=http://127.0.0.1:9900/v4/sms OKOCRM_WIDGET_PRIVATE_KEY=test APP_SECRET=test \
+    ENCRYPTION_KEY=$(python3 -m okocrm_redsms genkey) \
     PUBLIC_BASE_URL=https://<туннель или любой> POLL_AFTER_MINUTES=1 python3 -m okocrm_redsms
 
 Затем:
@@ -66,6 +67,7 @@ def main():
     p.add_argument("--phone", help="если указан — будет отправлена настоящая SMS (платно)")
     p.add_argument("--text", default="Тест интеграции OkoCRM ↔ REDSMS")
     p.add_argument("--port", type=int, default=9900)
+    p.add_argument("--telegram", action="store_true", help="включить каскад Telegram → SMS для кодов")
     a = p.parse_args()
 
     server = ThreadingHTTPServer(("127.0.0.1", a.port), FakeOko)
@@ -75,7 +77,7 @@ def main():
     print(" ", signed_post(a.bridge, "/okocrm/events", {
         "event": "installed", "site_id": 1, "subdomain": "simulate", "setting_ulid": ULID,
         "time": int(time.time()), "token": ULID + ".simulated-secret",
-        "settings": {"login": a.login, "api_key": a.api_key, "senders": a.sender}, "user": None}, a.private_key))
+        "settings": {"login": a.login, "api_key": a.api_key, "senders": a.sender, "telegram_codes": a.telegram}, "user": None}, a.private_key))
 
     if a.phone:
         time.sleep(2)

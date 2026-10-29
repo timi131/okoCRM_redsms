@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from . import http_client
 from .config import Config
-from .redsms import PENDING_STATUSES, RedsmsClient, to_oko_status
+from .redsms import CASCADE_ROUTE, PENDING_STATUSES, RedsmsClient, extract_code, to_oko_status
 from .store import Store
 
 log = logging.getLogger("okocrm_redsms")
@@ -22,7 +22,18 @@ STATUS_DELAY = 2.0                 # OkoCRM: статус не раньше, ч�
 OUTBOX_GIVE_UP = 24 * 3600
 SEND_RETRIES = 3
 
-STATUS_RANK = {"sent": 1, "delivered": 2, "read": 3, "failed": 0}
+# Статусы шага Telegram, после которых REDSMS сам отправляет SMS следующим шагом каскада
+CASCADE_CONTINUE = {"undelivered", "timeout"}
+CASCADE_CHILD_WAIT = 30 * 60  # сколько ждать появления SMS-шага, прежде чем признать отправку неудачной
+
+# Из какого текущего статуса новый уже не применяется. failed после delivered OkoCRM игнорирует сам;
+# sent после failed — запоздавший промежуточный статус; delivered после failed пропускаем — SMS всё-таки дошло
+BLOCKED_AFTER = {
+    "sent": ["delivered", "read", "failed"],
+    "delivered": ["read"],
+    "read": [],
+    "failed": ["delivered", "read"],
+}
 
 
 class SendError(Exception):
@@ -47,6 +58,7 @@ class Bridge:
         self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="bridge")
         self._stop = threading.Event()
         self._outbox_wakeup = threading.Event()
+        self._send_lock = threading.Lock()  # проверка лимитов и вставка — атомарно
         self._threads = []
 
     # ------------------------------------------------------------------
@@ -155,6 +167,7 @@ class Bridge:
         digits = sum(ch.isdigit() for ch in phone)
         if not 10 <= digits <= 15:
             raise SendError(422, "bad_number", f"Некорректный номер получателя: {phone or 'не указан'}"[:255])
+        phone = _normalize_phone(phone)
         if not text.strip():
             raise SendError(422, "empty_text", "Пустой текст SMS")
         if not sender:
@@ -167,17 +180,45 @@ class Bridge:
                 raise SendError(422, "send_at_too_far",
                                 "REDSMS принимает отложенную отправку не более чем на 7 дней вперёд")
 
-        message_id = self.store.insert_message({
-            "id": "rs-" + uuid.uuid4().hex,
-            "setting_ulid": ulid,
-            "message_key": key,
-            "phone": phone,
-            "sender": sender,
-            "text": text,
-            "send_at": send_at,
-        })
+        route = CASCADE_ROUTE if conn["tg_cascade"] and extract_code(text) else "sms"
+
+        with self._send_lock:
+            existing = self.store.find_by_key(ulid, key)
+            if existing is not None:
+                return existing["id"]
+            self._check_limits(conn, phone, text)
+            message_id = self.store.insert_message({
+                "id": "rs-" + uuid.uuid4().hex,
+                "setting_ulid": ulid,
+                "message_key": key,
+                "phone": phone,
+                "sender": sender,
+                "text": text,
+                "send_at": send_at,
+                "route": route,
+            })
         self.pool.submit(self._safe, self.submit_message, message_id)
         return message_id
+
+    def _check_limits(self, conn, phone: str, text: str) -> None:
+        """Защита от зацикленных автодействий и массовых ошибочных рассылок. 0 — лимит выключен."""
+        cfg, now, ulid = self.cfg, int(time.time()), conn["setting_ulid"]
+        per_hour = conn["limit_per_hour"] if conn["limit_per_hour"] is not None else cfg.rate_limit_per_hour
+        per_phone = (conn["limit_per_phone_hour"] if conn["limit_per_phone_hour"] is not None
+                     else cfg.rate_limit_per_phone_hour)
+        checks = [
+            (cfg.rate_limit_per_minute, 60, {}, f"не больше {cfg.rate_limit_per_minute} SMS в минуту"),
+            (per_hour, 3600, {}, f"не больше {per_hour} SMS в час"),
+            (per_phone, 3600, {"phone": phone}, f"не больше {per_phone} SMS в час на один номер"),
+            (1 if cfg.duplicate_window else 0, cfg.duplicate_window, {"phone": phone, "text": text},
+             f"такое же SMS на этот номер уже отправлено за последние {max(1, cfg.duplicate_window // 60)} мин"),
+        ]
+        for limit, window, filters, reason in checks:
+            if limit and self.store.count_recent(ulid, now - window, **filters) >= limit:
+                log.warning("лимит %s: %s (%s)", ulid, reason, phone)
+                raise SendError(429, "rate_limited",
+                                f"Лимит интеграции REDSMS: {reason}. Защита от зацикленных автодействий — "
+                                f"лимиты меняются в настройках виджета")
 
     def submit_message(self, message_id: str) -> None:
         if not self.store.claim_for_sending(message_id):
@@ -195,7 +236,11 @@ class Bridge:
         r = None
         for attempt in range(SEND_RETRIES):
             try:
-                r = client.send_sms(_normalize_phone(msg["phone"]), msg["text"], msg["sender"], dlr_url, start_time)
+                if msg["route"] == CASCADE_ROUTE:
+                    r = client.send_tg_then_sms(msg["phone"], extract_code(msg["text"]) or "", msg["text"],
+                                                msg["sender"], dlr_url, self.cfg.tg_validity, start_time)
+                else:
+                    r = client.send_sms(msg["phone"], msg["text"], msg["sender"], dlr_url, start_time)
                 break
             except http_client.TransportError as e:
                 if e.not_sent and attempt + 1 < SEND_RETRIES:
@@ -215,8 +260,9 @@ class Bridge:
         if r.status == 200 and items and items[0].get("uuid"):
             item = items[0]
             status = item.get("status") or "created"
-            self.store.update_message(message_id, state="submitted", redsms_uuid=item["uuid"], redsms_status=status)
-            log.info("submitted %s → REDSMS %s (%s)", message_id, item["uuid"], status)
+            self.store.update_message(message_id, state="submitted", redsms_uuid=item["uuid"],
+                                      root_uuid=item["uuid"], redsms_status=status)
+            log.info("submitted %s → REDSMS %s (%s, %s)", message_id, item["uuid"], msg["route"], status)
             if status not in PENDING_STATUSES:
                 self.apply_redsms_status(self.store.get_message(message_id), status)
             elif not start_time:
@@ -262,11 +308,21 @@ class Bridge:
             return
         msg = self.store.find_by_uuid(ulid, message_uuid)
         if msg is None:
-            log.info("DLR для неизвестного сообщения %s / %s", ulid, message_uuid)
-            return
+            # Возможно, это SMS-шаг каскада, о котором мы ещё не знаем
+            msg = self._adopt_cascade_child(ulid, message_uuid)
+            if msg is None:
+                log.info("DLR для неизвестного сообщения %s / %s", ulid, message_uuid)
+                return
+        elif message_uuid != msg["redsms_uuid"]:
+            return  # запоздалый статус шага Telegram — уже следим за SMS-шагом
         self.apply_redsms_status(msg, status)
 
     def apply_redsms_status(self, msg, status: str) -> None:
+        if _is_cascade_head(msg) and status in CASCADE_CONTINUE:
+            # Telegram не доставил код — это не ошибка: REDSMS сам отправит SMS следующим шагом
+            self.store.update_message(msg["id"], redsms_status=status)
+            self._follow_cascade(self.store.get_message(msg["id"]))
+            return
         fields: Dict[str, Any] = {"redsms_status": status}
         if status not in PENDING_STATUSES:
             fields["state"] = "final"
@@ -277,11 +333,40 @@ class Bridge:
         if status == "no_money":
             self.pool.submit(self._safe, self.check_health, msg["setting_ulid"])
 
+    def _follow_cascade(self, msg) -> None:
+        """Переключиться с шага Telegram на SMS-шаг каскада, если REDSMS его уже создал."""
+        conn = self.store.get_connection(msg["setting_ulid"])
+        if conn is None or not conn["api_key"]:
+            return
+        try:
+            r = self._redsms(conn).get_message(msg["redsms_uuid"], "uuid,status,child_uuid")
+        except http_client.TransportError as e:
+            log.warning("REDSMS cascade %s: %s", msg["id"], e)
+            return  # повторит опрос
+        child = ((r.json() or {}).get("item") or {}).get("child_uuid") if r.status == 200 else None
+        if child:
+            self.store.update_message(msg["id"], redsms_uuid=child, redsms_status="created")
+            log.info("cascade %s: Telegram не доставил, следим за SMS %s", msg["id"], child)
+
+    def _adopt_cascade_child(self, ulid: str, message_uuid: str):
+        conn = self.store.get_connection(ulid)
+        if conn is None or not conn["api_key"]:
+            return None
+        try:
+            r = self._redsms(conn).get_message(message_uuid, "uuid,status,parent_uuid")
+        except http_client.TransportError:
+            return None
+        parent = ((r.json() or {}).get("item") or {}).get("parent_uuid") if r.status == 200 else None
+        msg = self.store.find_by_uuid(ulid, parent) if parent else None
+        if msg is None or msg["route"] != CASCADE_ROUTE or msg["redsms_uuid"] != parent:
+            return None
+        self.store.update_message(msg["id"], redsms_uuid=message_uuid, redsms_status="created")
+        log.info("cascade %s: колбэк SMS-шага %s пришёл раньше статуса Telegram", msg["id"], message_uuid)
+        return self.store.get_message(msg["id"])
+
     def _push_status(self, msg, event: Dict[str, Any]) -> None:
         new = event["status"]
-        # OkoCRM сам игнорирует понижения, но лишние запросы не шлём: после delivered/read — только повышение
-        blocked = [s for s in ("delivered", "read") if STATUS_RANK[new] <= STATUS_RANK[s]]
-        if not self.store.advance_oko_status(msg["id"], new, blocked):
+        if not self.store.advance_oko_status(msg["id"], new, BLOCKED_AFTER[new]):
             return
         payload = {"event": "sms.status", "message_id": msg["id"], "time": int(time.time()), **event}
         delay = max(0.0, msg["created_at"] + STATUS_DELAY - time.time())
@@ -297,6 +382,12 @@ class Bridge:
             conn = self.store.get_connection(msg["setting_ulid"])
             if conn is None or not conn["api_key"]:
                 self.store.update_message(msg["id"], state="final")
+                continue
+            if _is_cascade_head(msg) and msg["redsms_status"] in CASCADE_CONTINUE:
+                self._follow_cascade(msg)
+                fresh = self.store.get_message(msg["id"])
+                if _is_cascade_head(fresh) and msg["created_at"] < now - CASCADE_CHILD_WAIT:
+                    self._fail(fresh, "cascade_failed", "Telegram не доставил код, а SMS-шаг каскада REDSMS не запустился")
                 continue
             try:
                 r = self._redsms(conn).get_message(msg["redsms_uuid"])
@@ -414,6 +505,10 @@ class Bridge:
 def _settings(event: Dict[str, Any]) -> Dict[str, Any]:
     s = event.get("settings")
     return s if isinstance(s, dict) else {}  # без полей OkoCRM присылает пустой массив
+
+
+def _is_cascade_head(msg) -> bool:
+    return msg["route"] == CASCADE_ROUTE and msg["redsms_uuid"] is not None and msg["redsms_uuid"] == msg["root_uuid"]
 
 
 def _normalize_phone(phone: str) -> str:

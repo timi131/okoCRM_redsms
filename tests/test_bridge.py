@@ -17,7 +17,11 @@ from okocrm_redsms import service  # noqa: E402
 from okocrm_redsms.config import Config  # noqa: E402
 from okocrm_redsms.http_server import make_server  # noqa: E402
 from okocrm_redsms.service import Bridge  # noqa: E402
+from okocrm_redsms.crypto import Cipher, generate_key  # noqa: E402
+from okocrm_redsms.redsms import extract_code  # noqa: E402
 from okocrm_redsms.store import Store, parse_senders, split_senders  # noqa: E402
+
+ENC_KEY = generate_key()
 
 PRIVATE_KEY = "widget-private-key"
 ULID = "01J8Z4N6QYUXH2FA3K5T8DGN2E"
@@ -33,6 +37,7 @@ class Fake:
         self.send_reply = (200, {"items": [{"uuid": "uuid-1", "status": "created", "status_time": 1, "to": "+7"}],
                                  "errors": [], "count": 1, "success": True})
         self.get_reply = (200, {"item": {"uuid": "uuid-1", "status": "delivered"}, "success": True})
+        self.get_items = {}  # uuid → item для GET /api/message/{uuid}
         fake = self
 
         class H(BaseHTTPRequestHandler):
@@ -49,7 +54,11 @@ class Fake:
                 elif p == "/api/message":
                     status, data = fake.send_reply
                 elif p.startswith("/api/message/"):
-                    status, data = fake.get_reply
+                    message_uuid = p.split("/")[3].split("?")[0]
+                    if message_uuid in fake.get_items:
+                        status, data = 200, {"item": fake.get_items[message_uuid], "success": True}
+                    else:
+                        status, data = fake.get_reply
                 elif p == "/v4/sms/senders":
                     status, data = 200, {"senders": len(body)}
                 elif p.startswith("/v4/sms/"):
@@ -83,7 +92,7 @@ class BridgeTest(unittest.TestCase):
                           okocrm_api_base=self.fake.base + "/v4/sms",
                           redsms_api_base=self.fake.base + "/api",
                           redsms_allowed_ips=[])
-        self.bridge = Bridge(self.cfg, Store(self.cfg.db_path))
+        self.bridge = Bridge(self.cfg, Store(self.cfg.db_path, Cipher([ENC_KEY])))
         self.bridge.start()
         self.server = make_server(self.bridge, "127.0.0.1", 0)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -300,6 +309,141 @@ class BridgeTest(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/healthz", timeout=5) as r:
             self.assertEqual(json.loads(r.read()), {"ok": True})
 
+    # --- лимиты ----------------------------------------------------------
+
+    def test_rate_limit_per_phone(self):
+        self.cfg.rate_limit_per_phone_hour = 2
+        self.install()
+        self.assertEqual(self.send(key="1" * 32, text="один")[0], 200)
+        self.assertEqual(self.send(key="2" * 32, text="два")[0], 200)
+        status, body = self.send(key="3" * 32, text="три")
+        self.assertEqual(status, 429)
+        self.assertEqual(body["error"]["code"], "rate_limited")
+        self.assertIn("на один номер", body["error"]["message"])
+        # другой номер — можно
+        self.assertEqual(self.send(key="4" * 32, text="три", phone="+79990000001")[0], 200)
+
+    def test_duplicate_text_rejected_but_retry_after_failure_allowed(self):
+        self.install()
+        _, first = self.send(key="1" * 32)
+        status, body = self.send(key="2" * 32)
+        self.assertEqual(status, 429)
+        self.assertIn("такое же SMS", body["error"]["message"])
+        # Менеджер жмёт «Повторить» после ошибки — лимит не мешает
+        self.wait(lambda: any(e["status"] == "sent" for e in self.oko_events()))
+        self.bridge._fail(self.bridge.store.get_message(first["message_id"]), "x", "ошибка")
+        self.bridge.apply_redsms_status(self.bridge.store.get_message(first["message_id"]), "progress")  # запоздавший sent
+        self.assertEqual(self.bridge.store.get_message(first["message_id"])["oko_status"], "failed")
+        self.assertEqual(self.send(key="3" * 32)[0], 200)
+
+    def test_limit_from_widget_settings(self):
+        self.install({"login": "user", "api_key": "KEY", "senders": "Shop", "limit_per_hour": "1"})
+        self.assertEqual(self.send(key="1" * 32, text="один")[0], 200)
+        status, body = self.send(key="2" * 32, text="два", phone="+79990000001")
+        self.assertEqual(status, 429)
+        self.assertIn("1 SMS в час", body["error"]["message"])
+
+    # --- каскад Telegram → SMS ------------------------------------------
+
+    def install_tg(self):
+        self.install({"login": "user", "api_key": "KEY", "senders": "Shop", "telegram_codes": True})
+
+    def dlr(self, body):
+        path = urllib.parse.urlsplit(self.bridge.dlr_url(ULID)).path
+        req = urllib.request.Request(self.base + path, data=body.encode(), method="POST",
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            self.assertEqual(r.status, 200)
+
+    def test_cascade_sends_code_via_telegram_then_sms(self):
+        self.install_tg()
+        _, body = self.send(text="Ваш код подтверждения: 4821")
+        self.wait(lambda: self.fake.find("POST", "/api/message"))
+        sent = self.fake.find("POST", "/api/message")[0][3]
+        self.assertEqual(sent["route"], "tgauth,sms")
+        self.assertEqual(sent["tgauth_text"], "4821")
+        self.assertEqual(sent["sms_text"], "Ваш код подтверждения: 4821")
+        self.assertEqual(sent["sms_from"], "Shop")
+        self.assertEqual(sent["tgauth_validity"], 180)
+        self.wait(lambda: self.bridge.store.find_by_uuid(ULID, "uuid-1") is not None)
+
+        # Telegram не доставил — это не ошибка, REDSMS создал SMS-шаг uuid-2
+        self.fake.get_items["uuid-1"] = {"uuid": "uuid-1", "status": "undelivered", "child_uuid": "uuid-2"}
+        self.dlr("uuid=uuid-1&status=undelivered")
+        self.wait(lambda: self.bridge.store.get_message(body["message_id"])["redsms_uuid"] == "uuid-2")
+        self.assertFalse(any(e["status"] == "failed" for e in self.oko_events()))
+
+        self.dlr("uuid=uuid-1&status=timeout")  # запоздалый статус Telegram игнорируется
+        self.dlr("uuid=uuid-2&status=delivered")
+        self.wait(lambda: any(e["status"] == "delivered" for e in self.oko_events()))
+        time.sleep(0.3)
+        self.assertFalse(any(e["status"] == "failed" for e in self.oko_events()))
+
+    def test_cascade_sms_callback_before_telegram_status(self):
+        self.install_tg()
+        _, body = self.send(text="Code 123456")
+        self.wait(lambda: self.bridge.store.find_by_uuid(ULID, "uuid-1") is not None)
+        self.fake.get_items["uuid-2"] = {"uuid": "uuid-2", "status": "delivered", "parent_uuid": "uuid-1"}
+        self.dlr("uuid=uuid-2&status=delivered")
+        self.wait(lambda: any(e["status"] == "delivered" for e in self.oko_events()))
+        self.assertEqual(self.bridge.store.get_message(body["message_id"])["redsms_uuid"], "uuid-2")
+
+    def test_cascade_telegram_delivered(self):
+        self.install_tg()
+        self.send(text="Ваш код 4821")
+        self.wait(lambda: self.bridge.store.find_by_uuid(ULID, "uuid-1") is not None)
+        self.dlr("uuid=uuid-1&status=delivered")
+        self.wait(lambda: any(e["status"] == "delivered" for e in self.oko_events()))
+
+    def test_notification_without_code_goes_as_plain_sms(self):
+        self.install_tg()
+        self.send(text="Заказ 12345 готов к выдаче")
+        self.wait(lambda: self.fake.find("POST", "/api/message"))
+        self.assertEqual(self.fake.find("POST", "/api/message")[0][3]["route"], "sms")
+
+    # --- шифрование -------------------------------------------------------
+
+    def test_secrets_are_encrypted_at_rest(self):
+        self.install()
+        import sqlite3
+        raw = sqlite3.connect(self.cfg.db_path).execute(
+            "SELECT token, api_key FROM connections WHERE setting_ulid = ?", (ULID,)).fetchone()
+        for value in raw:
+            self.assertTrue(value.startswith("enc:"))
+        self.assertNotIn("secret", raw[0])
+        conn = self.bridge.store.get_connection(ULID)
+        self.assertEqual((conn["token"], conn["api_key"]), (TOKEN, "KEY"))
+
+
+class CryptoTest(unittest.TestCase):
+    def test_plaintext_migration_and_key_rotation(self):
+        import sqlite3
+        old_key, new_key = generate_key(), generate_key()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "db.sqlite3")
+            Store(path, Cipher([old_key]))
+            c = sqlite3.connect(path)
+            c.execute("INSERT INTO connections (setting_ulid, token, api_key) VALUES (?, ?, ?)", (ULID, TOKEN, "KEY"))
+            c.commit()
+            # Старая версия хранила открытым текстом — при старте шифруется
+            store = Store(path, Cipher([old_key]))
+            self.assertTrue(c.execute("SELECT api_key FROM connections").fetchone()[0].startswith("enc:"))
+            self.assertEqual(store.get_connection(ULID)["api_key"], "KEY")
+            # Смена ключа: «новый,старый» → перешифровано новым, старый можно убрать
+            Store(path, Cipher([new_key, old_key]))
+            self.assertEqual(Store(path, Cipher([new_key])).get_connection(ULID)["token"], TOKEN)
+            with self.assertRaises(RuntimeError):  # чужой ключ — отказ при старте, а не порча данных
+                Store(path, Cipher([generate_key()]))
+
+    def test_extract_code(self):
+        self.assertEqual(extract_code("Ваш код: 4821"), "4821")
+        self.assertEqual(extract_code("Code 12345678 for login"), "12345678")
+        self.assertEqual(extract_code("Пароль для входа 0042"), "0042")
+        self.assertIsNone(extract_code("Заказ 12345 готов"))            # нет слова «код»
+        self.assertIsNone(extract_code("Код 1234 действует до 2026 г."))  # два числа — неоднозначно
+        self.assertIsNone(extract_code("Ваш код 123"))                   # короче 4 цифр
+        self.assertIsNone(extract_code("Код по номеру +79991234567"))   # телефон — не код
+
 
 class SendersTest(unittest.TestCase):
     def test_parse_senders(self):
@@ -319,7 +463,7 @@ class SendersTest(unittest.TestCase):
                       "status_message TEXT, installed_at INTEGER, updated_at INTEGER, deleted_at INTEGER)")
             c.commit()
             c.close()
-            store = Store(path)
+            store = Store(path, Cipher([ENC_KEY]))
             store.upsert_connection(ULID, 1, "demo", {"login": "u", "api_key": "k", "senders": "Shop, Тест"})
             self.assertEqual(json.loads(store.get_connection(ULID)["senders_rejected"]), ["Тест"])
 

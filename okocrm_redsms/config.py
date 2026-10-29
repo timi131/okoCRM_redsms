@@ -45,10 +45,21 @@ class Config:
     poll_after_minutes: int = 10
     # Сколько дней хранить завершённые сообщения и удалённые подключения; 0 — хранить всегда
     retention_days: int = 30
+    # Ключи Fernet для шифрования секретов в БД; первый шифрует, остальные — для смены ключа
+    encryption_keys: List[str] = field(default_factory=list)
+    # Лимиты на одно подключение (0 — выключен). Клиент может переопределить часовые в настройках виджета
+    rate_limit_per_minute: int = 60
+    rate_limit_per_hour: int = 1000
+    rate_limit_per_phone_hour: int = 10
+    # Одинаковый текст на тот же номер чаще, чем раз в столько секунд, отклоняется (0 — не проверять)
+    duplicate_window: int = 300
+    # Сколько секунд ждать доставки кода в Telegram, прежде чем каскад отправит SMS (минимум 60)
+    tg_validity: int = 180
 
     @classmethod
     def from_env(cls) -> "Config":
-        missing = [n for n in ("OKOCRM_WIDGET_PRIVATE_KEY", "APP_SECRET", "PUBLIC_BASE_URL") if not os.environ.get(n)]
+        missing = [n for n in ("OKOCRM_WIDGET_PRIVATE_KEY", "APP_SECRET", "PUBLIC_BASE_URL", "ENCRYPTION_KEY")
+                   if not os.environ.get(n)]
         if missing:
             raise SystemExit("Не заданы переменные окружения: " + ", ".join(missing))
         return cls(
@@ -65,4 +76,10 @@ class Config:
             healthcheck_interval=int(os.environ.get("HEALTHCHECK_INTERVAL", cls.healthcheck_interval)),
             poll_after_minutes=int(os.environ.get("POLL_AFTER_MINUTES", cls.poll_after_minutes)),
             retention_days=int(os.environ.get("RETENTION_DAYS", cls.retention_days)),
+            encryption_keys=_list("ENCRYPTION_KEY", []),
+            rate_limit_per_minute=int(os.environ.get("RATE_LIMIT_PER_MINUTE", cls.rate_limit_per_minute)),
+            rate_limit_per_hour=int(os.environ.get("RATE_LIMIT_PER_HOUR", cls.rate_limit_per_hour)),
+            rate_limit_per_phone_hour=int(os.environ.get("RATE_LIMIT_PER_PHONE_HOUR", cls.rate_limit_per_phone_hour)),
+            duplicate_window=int(os.environ.get("DUPLICATE_WINDOW", cls.duplicate_window)),
+            tg_validity=int(os.environ.get("TG_VALIDITY", cls.tg_validity)),
         )
