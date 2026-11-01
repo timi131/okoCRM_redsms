@@ -73,6 +73,9 @@ class Config:
     signature_max_age: int = 900
     # Сколько запросов обрабатывать одновременно; сверх — сразу 503
     max_concurrent_requests: int = 64
+    # Потоки отправки в REDSMS и доставки статусов в OkoCRM
+    send_workers: int = 32
+    outbox_workers: int = 32
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -104,6 +107,8 @@ class Config:
             tg_validity=int(os.environ.get("TG_VALIDITY", cls.tg_validity)),
             signature_max_age=int(os.environ.get("SIGNATURE_MAX_AGE", cls.signature_max_age)),
             max_concurrent_requests=int(os.environ.get("MAX_CONCURRENT_REQUESTS", cls.max_concurrent_requests)),
+            send_workers=int(os.environ.get("SEND_WORKERS", cls.send_workers)),
+            outbox_workers=int(os.environ.get("OUTBOX_WORKERS", cls.outbox_workers)),
         )
         if not _bool("ALLOW_INSECURE_URLS", False):
             # Ключ API REDSMS и токены OkoCRM не должны уходить по открытому HTTP

@@ -165,6 +165,8 @@ class _BoundedServer(ThreadingHTTPServer):
     """ThreadingHTTPServer с потолком одновременных запросов: сверх лимита — сразу 503, без нового потока."""
 
     daemon_threads = True
+    # По умолчанию очередь входящих соединений — 5: всплеск запросов от OkoCRM получил бы отказ в соединении
+    request_queue_size = 1024
 
     def __init__(self, addr, handler, max_concurrent: int):
         super().__init__(addr, handler)

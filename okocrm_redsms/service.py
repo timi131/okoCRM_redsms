@@ -21,6 +21,7 @@ log = logging.getLogger("okocrm_redsms")
 MAX_START_AHEAD = 7 * 86400 - 300  # REDSMS: startTime не позднее 7 дней
 STATUS_DELAY = 2.0                 # OkoCRM: статус не раньше, чем через 1–2 с после ответа на sms.send
 OUTBOX_GIVE_UP = 24 * 3600
+OKOCRM_MIN_INTERVAL = 0.21         # OkoCRM: не больше 5 запросов/с на токен (с запасом)
 SEND_RETRIES = 3
 
 # Статусы шага Telegram, после которых REDSMS сам отправляет SMS следующим шагом каскада
@@ -56,7 +57,15 @@ class Bridge:
     def __init__(self, cfg: Config, store: Store):
         self.cfg = cfg
         self.store = store
-        self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="bridge")
+        # Отправка в REDSMS: при задержке REDSMS ~150 мс один поток — ~6 SMS/с
+        self.pool = ThreadPoolExecutor(max_workers=cfg.send_workers, thread_name_prefix="send")
+        # Фон: проверки ключа и баланса, синхронизация отправителей — не должны задерживать отправку
+        self.bg_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bg")
+        # Доставка в OkoCRM: параллельно по подключениям, внутри подключения — по очереди
+        self.outbox_pool = ThreadPoolExecutor(max_workers=cfg.outbox_workers, thread_name_prefix="outbox")
+        self._outbox_busy: set = set()
+        self._outbox_busy_lock = threading.Lock()
+        self._last_oko_call: Dict[str, float] = {}
         self._stop = threading.Event()
         self._outbox_wakeup = threading.Event()
         self._send_lock = threading.Lock()  # проверка лимитов и вставка — атомарно
@@ -75,11 +84,11 @@ class Bridge:
             self.store.upsert_connection(ulid, event.get("site_id"), event.get("subdomain"),
                                          _settings(event), token=event.get("token"))
             log.info("installed: %s (%s)", ulid, event.get("subdomain"))
-            self.pool.submit(self._safe, self.sync_connection, ulid)
+            self.bg_pool.submit(self._safe, self.sync_connection, ulid)
         elif name == "settings_updated":
             self.store.upsert_connection(ulid, event.get("site_id"), event.get("subdomain"), _settings(event))
             log.info("settings_updated: %s", ulid)
-            self.pool.submit(self._safe, self.sync_connection, ulid)
+            self.bg_pool.submit(self._safe, self.sync_connection, ulid)
         elif name == "uninstalled":
             self.store.delete_connection(ulid)
             log.info("uninstalled: %s", ulid)
@@ -283,10 +292,10 @@ class Bridge:
         log.warning("REDSMS send %s: HTTP %s %s", message_id, r.status, redact(r.body[:300]))
         if r.status == 401:
             self._fail(msg, "unauthorized", "REDSMS отклонил авторизацию: проверьте логин и ключ API")
-            self.pool.submit(self._safe, self.check_health, msg["setting_ulid"])
+            self.bg_pool.submit(self._safe, self.check_health, msg["setting_ulid"])
         elif r.status == 420:
             self._fail(msg, "no_money", "Недостаточно средств на балансе REDSMS")
-            self.pool.submit(self._safe, self.check_health, msg["setting_ulid"])
+            self.bg_pool.submit(self._safe, self.check_health, msg["setting_ulid"])
         elif r.status == 400:
             self._fail(msg, "rejected", "REDSMS отклонил сообщение" + (f": {reason}" if reason else ""))
         else:
@@ -340,7 +349,7 @@ class Bridge:
         if event:
             self._push_status(self.store.get_message(msg["id"]), event)
         if status == "no_money":
-            self.pool.submit(self._safe, self.check_health, msg["setting_ulid"])
+            self.bg_pool.submit(self._safe, self.check_health, msg["setting_ulid"])
 
     def _follow_cascade(self, msg) -> None:
         """Переключиться с шага Telegram на SMS-шаг каскада, если REDSMS его уже создал."""
@@ -416,32 +425,70 @@ class Bridge:
         self._outbox_wakeup.set()
 
     def flush_outbox(self) -> None:
-        for item in self.store.due_outbox():
-            conn = self.store.get_connection(item["setting_ulid"])
-            if conn is None or not conn["token"]:
-                self.store.outbox_done(item["id"])
-                continue
-            method, path = {"events": ("POST", "/events"), "status": ("POST", "/status"),
-                            "senders": ("PUT", "/senders")}[item["kind"]]
-            headers = {"Authorization": f"Bearer {conn['token']}", "Accept": "application/json"}
-            try:
-                r = http_client.request(method, self.cfg.okocrm_api_base + path, headers,
-                                        json_body=json.loads(item["payload"]), timeout=10)
-            except http_client.TransportError as e:
-                self._retry(item, _backoff(item["attempts"]), str(e))
-                continue
-            if 200 <= r.status < 300:
-                self.store.outbox_done(item["id"])
-            elif r.status == 429:
-                self._retry(item, float(r.headers.get("retry-after") or 5), "429")
-            elif r.status in (409, 402) or r.status >= 500:
-                # 409 — клиент ещё не сохранил настройки / параллельный запрос; 402 — не оплачен тариф
-                delay = 600 if r.status == 402 else _backoff(item["attempts"])
-                self._retry(item, delay, f"HTTP {r.status} {r.body[:200]!r}")
-            else:
-                # 401/404 — токен отозван, 422 — невалидное тело: повтор не поможет
-                log.error("OkoCRM %s %s → HTTP %s %s", method, path, r.status, redact(r.body[:300]))
-                self.store.outbox_done(item["id"])
+        """Раздаёт готовые к отправке записи по подключениям: каждое подключение обслуживает один поток,
+        поэтому порядок внутри подключения сохраняется, а лимит OkoCRM на токен соблюдается."""
+        by_ulid: Dict[str, list] = {}
+        for item in self.store.due_outbox(limit=2000):
+            by_ulid.setdefault(item["setting_ulid"], []).append(item)
+        for ulid, items in by_ulid.items():
+            with self._outbox_busy_lock:
+                if ulid in self._outbox_busy:
+                    continue
+                self._outbox_busy.add(ulid)
+            self.outbox_pool.submit(self._flush_connection, ulid, items)
+
+    def _flush_connection(self, ulid: str, items: list) -> None:
+        try:
+            for item in items:
+                if self._stop.is_set() or not self._deliver(item):
+                    break  # повтор позже — остальные записи подключения тоже подождут, чтобы не нарушать порядок
+        except Exception:  # noqa: BLE001
+            log.exception("outbox %s", ulid)
+        finally:
+            with self._outbox_busy_lock:
+                self._outbox_busy.discard(ulid)
+            self._outbox_wakeup.set()
+
+    def _deliver(self, item) -> bool:
+        """Отправляет одну запись в OkoCRM. False — запись отложена на повтор."""
+        if not self.store.outbox_exists(item["id"]):
+            return True  # заменена более свежей (status/senders) или подключение удалено
+        conn = self.store.get_connection(item["setting_ulid"])
+        if conn is None or not conn["token"]:
+            self.store.outbox_done(item["id"])
+            return True
+        method, path = {"events": ("POST", "/events"), "status": ("POST", "/status"),
+                        "senders": ("PUT", "/senders")}[item["kind"]]
+        headers = {"Authorization": f"Bearer {conn['token']}", "Accept": "application/json"}
+        self._pace(item["setting_ulid"])
+        try:
+            r = http_client.request(method, self.cfg.okocrm_api_base + path, headers,
+                                    json_body=json.loads(item["payload"]), timeout=10)
+        except http_client.TransportError as e:
+            self._retry(item, _backoff(item["attempts"]), str(e))
+            return False
+        if 200 <= r.status < 300:
+            self.store.outbox_done(item["id"])
+            return True
+        if r.status == 429:
+            self._retry(item, float(r.headers.get("retry-after") or 5), "429")
+            return False
+        if r.status in (409, 402) or r.status >= 500:
+            # 409 — клиент ещё не сохранил настройки / параллельный запрос; 402 — не оплачен тариф
+            delay = 600 if r.status == 402 else _backoff(item["attempts"])
+            self._retry(item, delay, f"HTTP {r.status} {r.body[:200]!r}")
+            return False
+        # 401/404 — токен отозван, 422 — невалидное тело: повтор не поможет
+        log.error("OkoCRM %s %s → HTTP %s %s", method, path, r.status, redact(r.body[:300]))
+        self.store.outbox_done(item["id"])
+        return True
+
+    def _pace(self, ulid: str) -> None:
+        """Лимит OkoCRM — 5 запросов/с на токен: держим интервал не меньше OKOCRM_MIN_INTERVAL."""
+        wait = self._last_oko_call.get(ulid, 0.0) + OKOCRM_MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        self._last_oko_call[ulid] = time.monotonic()
 
     def _retry(self, item, delay: float, error: str) -> None:
         if time.time() - item["created_at"] > OUTBOX_GIVE_UP:
@@ -464,7 +511,8 @@ class Bridge:
     def stop(self) -> None:
         self._stop.set()
         self._outbox_wakeup.set()
-        self.pool.shutdown(wait=True)
+        for pool in (self.pool, self.bg_pool, self.outbox_pool):
+            pool.shutdown(wait=True)
 
     def recover(self) -> None:
         """После перезапуска: queued — отправить, sending — результат неизвестен, повторять нельзя."""
@@ -488,7 +536,7 @@ class Bridge:
                 last_health = time.time()
                 # Параллельно: у каждого подключения запрос в REDSMS до 10 с
                 for conn in self.store.active_connections():
-                    self.pool.submit(self._safe, self.check_health, conn["setting_ulid"])
+                    self.bg_pool.submit(self._safe, self.check_health, conn["setting_ulid"])
             if time.time() - last_purge >= 3600:
                 last_purge = time.time()
                 self._safe(self.purge)

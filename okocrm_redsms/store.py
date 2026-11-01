@@ -300,6 +300,9 @@ class Store:
         return self.conn().execute("SELECT * FROM outbox WHERE not_before <= ? ORDER BY id LIMIT ?",
                                    (time.time(), limit)).fetchall()
 
+    def outbox_exists(self, item_id: int) -> bool:
+        return self.conn().execute("SELECT 1 FROM outbox WHERE id = ?", (item_id,)).fetchone() is not None
+
     def outbox_done(self, item_id: int) -> None:
         self.conn().execute("DELETE FROM outbox WHERE id = ?", (item_id,))
 
