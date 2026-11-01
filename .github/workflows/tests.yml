@@ -10,15 +10,20 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      # Падение одной версии не отменяет проверку остальных
+      fail-fast: false
       matrix:
-        python: ["3.9", "3.12"]
+        include:
+          # Python 3.9 для ubuntu-latest (26.04) уже не собирают — проверяем на 24.04
+          - {python: "3.9", os: ubuntu-24.04}
+          - {python: "3.12", os: ubuntu-latest}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -r requirements.txt
@@ -30,10 +35,10 @@ jobs:
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install pip-audit bandit
