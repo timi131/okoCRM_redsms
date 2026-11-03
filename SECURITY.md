@@ -2,7 +2,7 @@
 
 ## Как сообщить об уязвимости
 
-Не публикуйте её в открытых Issues. Напишите на [email безопасности] или создайте приватный отчёт: GitHub → Security → Report a vulnerability. Ответим в течение [3 рабочих дней].
+Не публикуйте её в открытых Issues. Напишите в поддержку REDSMS: help@redsms.ru, или создайте приватный отчёт: GitHub → Security → Report a vulnerability.
 
 ## Что защищаем
 
