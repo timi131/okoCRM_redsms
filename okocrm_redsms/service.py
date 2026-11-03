@@ -190,7 +190,8 @@ class Bridge:
                 raise SendError(422, "send_at_too_far",
                                 "REDSMS принимает отложенную отправку не более чем на 7 дней вперёд")
 
-        route = CASCADE_ROUTE if conn["tg_cascade"] and extract_code(text) else "sms"
+        use_tg = self.cfg.telegram_cascade and conn["tg_cascade"]
+        route = CASCADE_ROUTE if use_tg and extract_code(text) else "sms"
 
         with self._send_lock:
             existing = self.store.find_by_key(ulid, key)

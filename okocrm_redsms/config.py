@@ -69,6 +69,9 @@ class Config:
     duplicate_window: int = 300
     # Сколько секунд ждать доставки кода в Telegram, прежде чем каскад отправит SMS (минимум 60)
     tg_validity: int = 180
+    # Каскад «код в Telegram → SMS». Выключен: в виджете поля нет, код оставлен на будущее.
+    # Включается вместе с возвратом поля telegram_codes в widget/config.json
+    telegram_cascade: bool = False
     # Подписанный запрос OkoCRM старше стольких секунд (по полю time) отклоняется — защита от повтора; 0 — не проверять
     signature_max_age: int = 900
     # Сколько запросов обрабатывать одновременно; сверх — сразу 503
@@ -105,6 +108,7 @@ class Config:
             rate_limit_per_phone_hour=int(os.environ.get("RATE_LIMIT_PER_PHONE_HOUR", cls.rate_limit_per_phone_hour)),
             duplicate_window=int(os.environ.get("DUPLICATE_WINDOW", cls.duplicate_window)),
             tg_validity=int(os.environ.get("TG_VALIDITY", cls.tg_validity)),
+            telegram_cascade=_bool("ENABLE_TELEGRAM_CASCADE", False),
             signature_max_age=int(os.environ.get("SIGNATURE_MAX_AGE", cls.signature_max_age)),
             max_concurrent_requests=int(os.environ.get("MAX_CONCURRENT_REQUESTS", cls.max_concurrent_requests)),
             send_workers=int(os.environ.get("SEND_WORKERS", cls.send_workers)),

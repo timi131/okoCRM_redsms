@@ -350,6 +350,7 @@ class BridgeTest(unittest.TestCase):
     # --- каскад Telegram → SMS ------------------------------------------
 
     def install_tg(self):
+        self.cfg.telegram_cascade = True
         self.install({"login": "user", "api_key": "KEY", "senders": "Shop", "telegram_codes": True})
 
     def dlr(self, body):
@@ -398,6 +399,13 @@ class BridgeTest(unittest.TestCase):
         self.wait(lambda: self.bridge.store.find_by_uuid(ULID, "uuid-1") is not None)
         self.dlr("uuid=uuid-1&status=delivered")
         self.wait(lambda: any(e["status"] == "delivered" for e in self.oko_events()))
+
+    def test_telegram_cascade_off_by_default(self):
+        # Без ENABLE_TELEGRAM_CASCADE каскад не запускается, даже если в настройках подключения осталась галочка
+        self.install({"login": "user", "api_key": "KEY", "senders": "Shop", "telegram_codes": True})
+        self.send(text="Ваш код 4821")
+        self.wait(lambda: self.fake.find("POST", "/api/message"))
+        self.assertEqual(self.fake.find("POST", "/api/message")[0][3]["route"], "sms")
 
     def test_notification_without_code_goes_as_plain_sms(self):
         self.install_tg()
