@@ -66,8 +66,8 @@ def _print_connection(store: Store, c: Dict[str, Any], limit: int) -> None:
     print(f"  Имена отправителей:   {', '.join(senders) if senders else 'НЕТ'}")
     if rejected:
         print(f"  Отклонены проверкой:  {', '.join(rejected)}  (кириллица / длиннее 15 / недопустимые символы)")
-    print(f"  Лимиты из виджета:    в час {c.get('limit_per_hour') if c.get('limit_per_hour') is not None else 'по умолчанию'}, "
-          f"на номер {c.get('limit_per_phone_hour') if c.get('limit_per_phone_hour') is not None else 'по умолчанию'}")
+    print(f"  Лимиты из виджета:    в час {c.get('limit_per_hour') if c.get('limit_per_hour') is not None else 'не задан'}, "
+          f"на номер {c.get('limit_per_phone_hour') if c.get('limit_per_phone_hour') is not None else 'не задан'}")
     status = c["status"] or "ещё не отправлялся"
     print(f"  Статус в OkoCRM:      {status}{(' — ' + c['status_message']) if c['status_message'] else ''}")
 
