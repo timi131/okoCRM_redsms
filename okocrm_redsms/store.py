@@ -71,12 +71,15 @@ CREATE INDEX IF NOT EXISTS outbox_due ON outbox (not_before);
 class Store:
     """SQLite-хранилище. Отдельное соединение на поток, WAL — чтобы HTTP-потоки и воркеры не мешали друг другу."""
 
-    def __init__(self, path: str, cipher: Cipher):
+    def __init__(self, path: str, cipher: Cipher, migrate: bool = True):
         self.path = path
         self.cipher = cipher
+        self._local = threading.local()
+        if not migrate:
+            # Режим для диагностики рядом с работающим сервисом: без миграций и перешифровки
+            return
         if path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        self._local = threading.local()
         c = self.conn()
         c.executescript(SCHEMA)
         # Миграции для баз, созданных предыдущими версиями

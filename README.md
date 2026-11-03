@@ -72,7 +72,8 @@ OkoCRM ◀──PUT senders · POST status · POST events───────�
 
 - [docs/CONNECT.md](docs/CONNECT.md) — как развернуть мост, собрать виджет и подключить его в OkoCRM
 - [docs/TESTING.md](docs/TESTING.md) — автотесты, симулятор OkoCRM и чеклист сквозной проверки
-- [docs/SUPPORT.md](docs/SUPPORT.md) — логи, частые ошибки клиентов, обновление, резервные копии, ключи
+- [docs/HELPDESK.md](docs/HELPDESK.md) — **руководство техподдержки REDSMS**: что спросить у клиента, тексты ошибок и их причины, команда диагностики, эскалация
+- [docs/SUPPORT.md](docs/SUPPORT.md) — эксплуатация сервера: логи, обновление, резервные копии, ключи
 - [docs/STORE.md](docs/STORE.md) — тексты для OkoStore, анонса и FAQ клиентов
 - [SECURITY.md](SECURITY.md) — модель угроз, меры защиты, как сообщить об уязвимости
 

@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Интеграция с OkoCRM</title>
+<meta name="description" content="Виджет REDSMS для OkoCRM: отправка SMS из карточки, шаблонов, автодействий и ИИ-ассистента со статусами доставки в ленте.">
+<style>
+  :root {
+    --bg: #ffffff;
+    --surface: #f6f7f9;
+    --text: #1c1e21;
+    --muted: #5f6368;
+    --border: #e3e5e8;
+    --accent: #db3340;
+    --accent-soft: #fdecee;
+    --note-bg: #eef4ff;
+    --note-border: #4c7bd9;
+    --code-bg: #f1f2f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #18191b;
+      --surface: #212225;
+      --text: #e8e9eb;
+      --muted: #a1a5ab;
+      --border: #33353a;
+      --accent: #ff5b67;
+      --accent-soft: #3a1d21;
+      --note-bg: #1c2638;
+      --note-border: #6f9bf0;
+      --code-bg: #2a2c30;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #18191b;
+    --surface: #212225;
+    --text: #e8e9eb;
+    --muted: #a1a5ab;
+    --border: #33353a;
+    --accent: #ff5b67;
+    --accent-soft: #3a1d21;
+    --note-bg: #1c2638;
+    --note-border: #6f9bf0;
+    --code-bg: #2a2c30;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  .layout {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 32px 16px 64px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 220px;
+    gap: 48px;
+  }
+  main { min-width: 0; }
+  .crumbs { font-size: 14px; color: var(--muted); margin-bottom: 12px; }
+  .crumbs a { color: var(--muted); }
+  h1 { font-size: 34px; line-height: 1.2; margin: 0 0 20px; letter-spacing: -0.01em; }
+  h2 { font-size: 24px; line-height: 1.3; margin: 44px 0 14px; scroll-margin-top: 16px; }
+  p { margin: 0 0 14px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ul, ol { margin: 0 0 16px; padding-left: 24px; }
+  li { margin: 6px 0; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    padding: 1px 6px;
+    border-radius: 4px;
+  }
+  .lead { font-size: 17px; }
+  .steps { counter-reset: step; list-style: none; padding: 0; }
+  .steps > li {
+    counter-increment: step;
+    position: relative;
+    padding-left: 44px;
+    margin: 0 0 18px;
+  }
+  .steps > li::before {
+    content: counter(step);
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 15px;
+    display: grid;
+    place-items: center;
+  }
+  .shot {
+    margin: 12px 0 4px;
+    border: 2px dashed var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    min-height: 140px;
+    display: grid;
+    place-items: center;
+    text-align: center;
+    padding: 20px 16px;
+    color: var(--muted);
+    font-size: 14px;
+  }
+  .shot strong { display: block; color: var(--text); font-size: 13px; margin-bottom: 4px; font-family: ui-monospace, Menlo, monospace; }
+  .note {
+    border-left: 4px solid var(--note-border);
+    background: var(--note-bg);
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin: 20px 0;
+  }
+  .note-title { font-weight: 700; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+  .note p:last-child { margin: 0; }
+  .table-wrap { overflow-x: auto; margin: 0 0 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 15px; }
+  th, td { text-align: left; vertical-align: top; padding: 10px 12px; border: 1px solid var(--border); }
+  th { background: var(--surface); font-weight: 600; }
+  .faq dt { font-weight: 700; margin-top: 18px; }
+  .faq dd { margin: 4px 0 0; }
+  .placeholder { background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 4px; font-family: ui-monospace, Menlo, monospace; font-size: 0.88em; }
+  .toc { position: sticky; top: 24px; align-self: start; font-size: 14px; border-left: 1px solid var(--border); padding-left: 16px; }
+  .toc-title { font-weight: 600; margin-bottom: 8px; }
+  .toc a { display: block; color: var(--muted); padding: 3px 0; }
+  .toc a:hover { color: var(--accent); }
+  .pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--border); font-size: 14px; color: var(--muted); }
+  @media (max-width: 860px) {
+    .layout { grid-template-columns: 1fr; gap: 0; padding-top: 20px; }
+    .toc { display: none; }
+    h1 { font-size: 28px; }
+    h2 { font-size: 21px; margin-top: 36px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="crumbs"><a href="https://docs.redsms.ru/integration/1c-bitrix/">Готовые интеграции</a> › OkoCRM</div>
+  <h1>Интеграция с OkoCRM</h1>
+
+  <p class="lead">Виджет REDSMS подключает сервис к OkoCRM как SMS-шлюз. Отправляйте SMS клиентам из карточки, по шаблону, автодействием в воронке или через ИИ-ассистента OkoCRM. Статус доставки сразу виден в ленте клиента.</p>
+
+  <p>Какие возможности доступны в интеграции:</p>
+  <ul>
+    <li>отправка SMS из карточки сделки, контакта или компании;</li>
+    <li>шаблоны SMS и автодействие «Отправить SMS» в воронке продаж;</li>
+    <li>отправка SMS через ИИ-ассистента OkoCRM;</li>
+    <li>статусы доставки в ленте клиента и причина недоставки на русском языке;</li>
+    <li>отложенная отправка — до 7 дней вперёд;</li>
+    <li>несколько имён отправителей с выбором при отправке, в шаблонах и автодействиях;</li>
+    <li>лимиты отправки на аккаунт и на номер — защита от зацикленных автодействий;</li>
+    <li>если на балансе закончились средства или ключ API перестал работать, кнопка SMS в OkoCRM отключается, а администратор получает уведомление.</li>
+  </ul>
+
+  <h2 id="connect">Как подключить</h2>
+  <ol class="steps">
+    <li><a href="https://docs.redsms.ru/knowledge-base/settings/#http-api">Создайте API-ключ</a> и скопируйте его.</li>
+    <li>Зайдите в OkoCRM и откройте раздел <strong>OkoStore</strong>.
+      <div class="shot"><div><strong>okocrm-1.png</strong>Раздел OkoStore в меню OkoCRM</div></div>
+    </li>
+    <li>В поисковой строке введите «REDSMS», найдите виджет и нажмите <strong>Установить</strong>.
+      <div class="shot"><div><strong>okocrm-2.png</strong>Карточка виджета REDSMS в OkoStore</div></div>
+    </li>
+    <li>В настройках виджета введите логин (указанный при регистрации в сервисе REDSMS.RU), ключ API и имена отправителей. Нажмите <strong>Сохранить</strong>.
+      <div class="shot"><div><strong>okocrm-3.png</strong>Настройки виджета, ключ API скрыт</div></div>
+    </li>
+    <li>Откройте вкладку <strong>Подключение</strong> в настройках виджета. Если там появились ваши имена отправителей и нет сообщения об ошибке — интеграция готова.</li>
+  </ol>
+
+  <div class="note">
+    <div class="note-title">Примечание</div>
+    <p>Имена отправителей вводятся через запятую, точно как они зарегистрированы в REDSMS: латиницей, до 15 символов. Если в разделе «Настройки → HTTP API» включён белый список IP, добавьте в него IP интеграции <span class="placeholder">XXX.XXX.XXX.XXX</span>.</p>
+  </div>
+
+  <h2 id="settings">Настройки виджета</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Поле</th><th>Что указать</th></tr></thead>
+      <tbody>
+        <tr><td>Логин REDSMS</td><td>Логин, указанный при регистрации в сервисе REDSMS.RU</td></tr>
+        <tr><td>Ключ API REDSMS</td><td>Ключ из раздела «Настройки → HTTP API»</td></tr>
+        <tr><td>Имена отправителей</td><td>Одно или несколько через запятую, например <code>MyShop, MyShop-2</code></td></tr>
+        <tr><td>Лимит SMS в час на аккаунт</td><td>Необязательно. Пусто — 1000, <code>0</code> — без лимита</td></tr>
+        <tr><td>Лимит SMS в час на один номер</td><td>Необязательно. Пусто — 10, <code>0</code> — без лимита</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="send">Как отправить SMS</h2>
+  <ul>
+    <li><strong>Из карточки</strong> — откройте сделку, контакт или компанию, нажмите кнопку SMS, выберите отправителя и отправьте сообщение.</li>
+    <li><strong>По шаблону</strong> — создайте шаблон SMS в OkoCRM и выберите его при отправке.</li>
+    <li><strong>Автоматически</strong> — добавьте в воронку автодействие «Отправить SMS» на нужном этапе. Если отправитель не выбран, используется первое имя из настроек.</li>
+    <li><strong>Отложенно</strong> — укажите время отправки в шаблоне или автодействии, не более чем на 7 дней вперёд.</li>
+  </ul>
+  <div class="shot"><div><strong>okocrm-4.png</strong>Окно отправки SMS из карточки</div></div>
+
+  <h2 id="statuses">Статусы в ленте</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Что видно в ленте</th><th>Что это значит</th></tr></thead>
+      <tbody>
+        <tr><td>Одна галка</td><td>REDSMS принял сообщение и передал оператору</td></tr>
+        <tr><td>Две галки</td><td>Сообщение доставлено абоненту</td></tr>
+        <tr><td>Красная заметка с причиной и кнопкой «Повторить»</td><td>Сообщение не доставлено: например, «Номер получателя находится в стоп-листе REDSMS» или «Некорректный номер телефона получателя»</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="shot"><div><strong>okocrm-5.png</strong>Лента с доставленной SMS и заметкой о недоставке</div></div>
+
+  <h2 id="faq">Частые вопросы</h2>
+  <dl class="faq">
+    <dt>В настройках виджета ошибка «REDSMS отклонил авторизацию».</dt>
+    <dd>Проверьте логин и ключ API. Если в разделе «Настройки → HTTP API» включён белый список IP, добавьте в него IP интеграции.</dd>
+
+    <dt>Кнопка SMS в карточке неактивна.</dt>
+    <dd>Скорее всего, на балансе закончились средства. Пополните баланс — отправка включится автоматически в течение 10 минут или сразу после повторного сохранения настроек виджета.</dd>
+
+    <dt>В ленте ошибка «Лимит интеграции REDSMS».</dt>
+    <dd>Сработала защита от лишних отправок: лимит в час на аккаунт, лимит на один номер или повтор одинакового SMS на тот же номер в течение 5 минут. Если это плановая рассылка, увеличьте лимиты в настройках виджета или укажите <code>0</code>, чтобы снять ограничение.</dd>
+
+    <dt>Можно ли отправлять сообщения в Telegram?</dt>
+    <dd>Для переписки с клиентами в Telegram используйте штатную интеграцию мессенджеров OkoCRM. Виджет REDSMS отправляет SMS — на любой номер, без предварительной переписки и со статусом доставки.</dd>
+
+    <dt>Приходят ли в OkoCRM ответы клиентов на SMS?</dt>
+    <dd>Нет, входящие SMS в интеграции не поддерживаются.</dd>
+  </dl>
+
+  <h2 id="support">Поддержка</h2>
+  <p>По вопросам подключения и работы интеграции пишите на <a href="mailto:help@redsms.ru">help@redsms.ru</a>. Чтобы мы быстрее разобрались, укажите поддомен вашего аккаунта OkoCRM, время отправки и текст ошибки из ленты или настроек виджета.</p>
+
+  <div class="pager">
+    <span>Предыдущая страница: Интеграция с Mindbox</span>
+    <span>Следующая страница: Интеграция с PlanFix</span>
+  </div>
+</main>
+
+<nav class="toc" aria-label="Содержание этой страницы">
+  <div class="toc-title">Содержание этой страницы</div>
+  <a href="#connect">Как подключить</a>
+  <a href="#settings">Настройки виджета</a>
+  <a href="#send">Как отправить SMS</a>
+  <a href="#statuses">Статусы в ленте</a>
+  <a href="#faq">Частые вопросы</a>
+  <a href="#support">Поддержка</a>
+</nav>
+</div>
+</body>
+</html>

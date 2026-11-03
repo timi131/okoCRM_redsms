@@ -2,6 +2,12 @@
 
 ## Где смотреть
 
+Для разбора обращений клиентов есть команда диагностики (только чтение, без секретов) и руководство поддержки — [HELPDESK.md](HELPDESK.md):
+
+```bash
+sudo docker compose exec bridge python -m okocrm_redsms diag --subdomain <поддомен> --check
+```
+
 ```bash
 docker logs -f okocrm-redsms          # события: installed, submitted, status, ошибки REDSMS/OkoCRM
 curl https://sms.example.com/healthz  # жив ли мост и доступна ли база (503, если нет)

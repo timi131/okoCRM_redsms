@@ -469,6 +469,30 @@ class BridgeTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_diag_shows_connection_without_secrets(self):
+        import contextlib, io
+        from okocrm_redsms import diag
+        self.install()
+        _, body = self.send(text="Ваш код 4821")
+        self.wait(lambda: self.bridge.store.find_by_uuid(ULID, "uuid-1") is not None)
+        env = {"OKOCRM_WIDGET_PRIVATE_KEY": PRIVATE_KEY, "APP_SECRET": "s" * 32, "ENCRYPTION_KEY": ENC_KEY,
+               "PUBLIC_BASE_URL": "https://bridge.example.com", "DB_PATH": self.cfg.db_path,
+               "REDSMS_API_BASE": self.cfg.redsms_api_base, "OKOCRM_API_BASE": self.cfg.okocrm_api_base,
+               "ALLOW_INSECURE_URLS": "true"}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out):
+            self.assertEqual(diag.main(["--subdomain", "demo", "--check"]), 0)
+            self.assertEqual(diag.main(["--message", body["message_id"]]), 0)
+            self.assertEqual(diag.main(["--uuid", "uuid-1"]), 0)
+            self.assertEqual(diag.main(["--list"]), 0)
+            self.assertEqual(diag.main(["--subdomain", "nope"]), 1)
+        text = out.getvalue()
+        self.assertIn(ULID, text)
+        self.assertIn("+7999***4567", text)
+        self.assertIn("Проверка REDSMS сейчас: ok", text)
+        for secret in ("KEY", TOKEN, "79991234567", "4821"):
+            self.assertNotIn(secret, text.replace("Ключ API REDSMS:      указан", ""))
+
 
 class SecurityUnitTest(unittest.TestCase):
     def test_mask_and_redact(self):

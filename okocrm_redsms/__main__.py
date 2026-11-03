@@ -17,6 +17,9 @@ def main() -> None:
     if sys.argv[1:] == ["genkey"]:
         print(generate_key())
         return
+    if sys.argv[1:2] == ["diag"]:
+        from .diag import main as diag_main
+        sys.exit(diag_main(sys.argv[2:]))
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = Config.from_env()
